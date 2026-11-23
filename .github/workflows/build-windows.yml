@@ -56,10 +56,17 @@ jobs:
         working-directory: ${{ runner.temp }}/repo
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Path 'build' -Force | Out-Null
+          if (-not (Test-Path 'build/icon.ico') -and (Test-Path 'electron/icon.ico')) {
+            Copy-Item 'electron/icon.ico' 'build/icon.ico' -Force
+          }
+          if (-not (Test-Path 'build/icon.png') -and (Test-Path 'electron/icon.png')) {
+            Copy-Item 'electron/icon.png' 'build/icon.png' -Force
+          }
           $required = @('build/icon.ico', 'build/icon.png', 'electron/icon.ico', 'electron/icon.png')
           foreach ($file in $required) {
-            if (-not (Test-Path $file)) {
-              throw "Missing required icon asset: $file"
+            if (-not (Test-Path $file) -or ((Get-Item $file).Length -eq 0)) {
+              throw "Missing or empty required icon asset: $file"
             }
           }
 
