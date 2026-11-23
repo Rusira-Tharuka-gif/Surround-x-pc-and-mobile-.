@@ -14,10 +14,15 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-repo
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          path: src-repo
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -25,14 +30,17 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
+        working-directory: src-repo
         run: npm install --legacy-peer-deps
 
       - name: Typecheck and run unit tests
+        working-directory: src-repo
         run: |
           npm run lint
           npm test
 
       - name: Verify Electron & Windows icon assets
+        working-directory: src-repo
         shell: pwsh
         run: |
           $required = @('build/icon.ico', 'build/icon.png', 'electron/icon.ico', 'electron/icon.png')
@@ -43,9 +51,11 @@ jobs:
           }
 
       - name: Build web bundle
+        working-directory: src-repo
         run: npm run build
 
       - name: Package Windows NSIS & Portable (.exe)
+        working-directory: src-repo
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
         run: npx electron-builder --win --x64
@@ -54,5 +64,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Surround-X-Windows-exe
-          path: release/*.exe
+          path: src-repo/release/*.exe
           if-no-files-found: error
