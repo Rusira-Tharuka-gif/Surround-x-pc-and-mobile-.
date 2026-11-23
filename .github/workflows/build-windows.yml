@@ -14,9 +14,6 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: ${{ runner.temp }}/repo
 
     steps:
       - name: Checkout repository
