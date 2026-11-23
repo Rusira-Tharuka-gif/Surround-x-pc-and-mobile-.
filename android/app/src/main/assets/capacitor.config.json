@@ -1,0 +1,9 @@
+{
+	"appId": "com.surroundx.studio",
+	"appName": "Surround X",
+	"webDir": "dist",
+	"backgroundColor": "#07090E",
+	"android": {
+		"allowMixedContent": true
+	}
+}

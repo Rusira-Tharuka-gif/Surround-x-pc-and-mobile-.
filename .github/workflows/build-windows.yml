@@ -1,0 +1,58 @@
+name: Build Windows Desktop (.exe)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Typecheck and run unit tests
+        run: |
+          npm run lint
+          npm test
+
+      - name: Verify Electron & Windows icon assets
+        shell: pwsh
+        run: |
+          $required = @('build/icon.ico', 'build/icon.png', 'electron/icon.ico', 'electron/icon.png')
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "Missing required icon asset: $file"
+            }
+          }
+
+      - name: Build web bundle
+        run: npm run build
+
+      - name: Package Windows NSIS & Portable (.exe)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npx electron-builder --win --x64
+
+      - name: Upload Windows .exe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Surround-X-Windows-exe
+          path: release/*.exe
+          if-no-files-found: error

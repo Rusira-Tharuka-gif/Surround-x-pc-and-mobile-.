@@ -1,0 +1,24 @@
+node_modules/
+build/
+!build/icon.ico
+!build/icon.png
+dist/
+dist-electron/
+release/
+out/
+*.exe
+*.blockmap
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Android / Capacitor build artifacts
+android/.gradle/
+android/app/build/
+android/build/
+android/local.properties
+android/app/src/main/assets/public/
+android/app/src/main/res/raw/
+
