@@ -16,13 +16,29 @@ jobs:
     runs-on: windows-latest
     defaults:
       run:
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          path: src-repo
+        working-directory: ${{ runner.temp }}
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repoDir = Join-Path $env:RUNNER_TEMP "repo"
+          if (Test-Path $repoDir) {
+            Remove-Item -Recurse -Force $repoDir
+          }
+          New-Item -ItemType Directory -Path $repoDir -Force | Out-Null
+          git -C $repoDir init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $repoDir remote add origin "https://github.com/${{ github.repository }}.git"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$($env:GITHUB_TOKEN)"))
+          git -C $repoDir -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basicAuth" fetch --depth=1 origin "${{ github.ref }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $repoDir checkout --force FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -30,17 +46,17 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
         run: npm install --legacy-peer-deps
 
       - name: Typecheck and run unit tests
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
         run: |
           npm run lint
           npm test
 
       - name: Verify Electron & Windows icon assets
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
         shell: pwsh
         run: |
           $required = @('build/icon.ico', 'build/icon.png', 'electron/icon.ico', 'electron/icon.png')
@@ -51,11 +67,11 @@ jobs:
           }
 
       - name: Build web bundle
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
         run: npm run build
 
       - name: Package Windows NSIS & Portable (.exe)
-        working-directory: src-repo
+        working-directory: ${{ runner.temp }}/repo
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
         run: npx electron-builder --win --x64
@@ -64,5 +80,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Surround-X-Windows-exe
-          path: src-repo/release/*.exe
+          path: ${{ runner.temp }}/repo/release/*.exe
           if-no-files-found: error
