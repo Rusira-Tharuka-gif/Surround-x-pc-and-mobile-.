@@ -173,6 +173,8 @@ export function buildFfmpegArgsForFormat(
         '-vn',
         '-c:a',
         'flac',
+        '-compression_level',
+        '2',
         '-ar',
         '48000',
         '-ac',
@@ -192,6 +194,8 @@ export function buildFfmpegArgsForFormat(
         'libmp3lame',
         '-b:a',
         '320k',
+        '-compression_level',
+        '5',
         '-ar',
         '48000',
         '-ac',
@@ -530,6 +534,52 @@ export function decodePcmWavToChannels(
   const numFrames = Math.min(maxFrames, Math.floor(dataLength / blockAlign));
   const channels = Array.from({ length: numChannels }, () => new Float32Array(numFrames));
 
+  if (
+    IS_LITTLE_ENDIAN &&
+    audioFormat === 1 &&
+    bitsPerSample === 16 &&
+    ((wavBytes.byteOffset + dataOffset) & 1) === 0
+  ) {
+    const pcm16 = new Int16Array(
+      wavBytes.buffer,
+      wavBytes.byteOffset + dataOffset,
+      numFrames * numChannels,
+    );
+    const inv32768 = 1 / 32768;
+    if (numChannels === 2) {
+      const ch0 = channels[0];
+      const ch1 = channels[1];
+      for (let f = 0, idx = 0; f < numFrames; f++, idx += 2) {
+        ch0[f] = pcm16[idx] * inv32768;
+        ch1[f] = pcm16[idx + 1] * inv32768;
+      }
+      return { sampleRate, channels };
+    }
+    if (numChannels === 6) {
+      const ch0 = channels[0];
+      const ch1 = channels[1];
+      const ch2 = channels[2];
+      const ch3 = channels[3];
+      const ch4 = channels[4];
+      const ch5 = channels[5];
+      for (let f = 0, idx = 0; f < numFrames; f++, idx += 6) {
+        ch0[f] = pcm16[idx] * inv32768;
+        ch1[f] = pcm16[idx + 1] * inv32768;
+        ch2[f] = pcm16[idx + 2] * inv32768;
+        ch3[f] = pcm16[idx + 3] * inv32768;
+        ch4[f] = pcm16[idx + 4] * inv32768;
+        ch5[f] = pcm16[idx + 5] * inv32768;
+      }
+      return { sampleRate, channels };
+    }
+    for (let f = 0, idx = 0; f < numFrames; f++) {
+      for (let ch = 0; ch < numChannels; ch++, idx++) {
+        channels[ch][f] = pcm16[idx] * inv32768;
+      }
+    }
+    return { sampleRate, channels };
+  }
+
   let offset = dataOffset;
   for (let f = 0; f < numFrames; f++) {
     for (let ch = 0; ch < numChannels; ch++) {
@@ -775,6 +825,7 @@ export class StreamingMatrixUpmix51 {
   private srEchoDampY = 0;
 
   private readonly pwrSmooth: number;
+  private readonly pwrAlpha: number;
   private pwrL = 0;
   private pwrR = 0;
   private pwrCross = 0;
@@ -796,12 +847,14 @@ export class StreamingMatrixUpmix51 {
   private readonly tapEcho1SL: number;
   private readonly tapEcho2SL: number;
   private readonly ringSL: Float32Array;
+  private readonly ringLenSL: number;
   private idxSL = 0;
 
   private readonly tapDirectSR: number;
   private readonly tapEcho1SR: number;
   private readonly tapEcho2SR: number;
   private readonly ringSR: Float32Array;
+  private readonly ringLenSR: number;
   private idxSR = 0;
 
   private readonly centerAmt: number;
@@ -852,6 +905,7 @@ export class StreamingMatrixUpmix51 {
     this.alphaEchoDamp = dt / (rcEchoDamp + dt);
 
     this.pwrSmooth = Math.exp(-1 / (sampleRate * 0.008));
+    this.pwrAlpha = 1 - this.pwrSmooth;
 
     this.apLenSL = Math.max(4, Math.round(sampleRate * 0.0043));
     this.apLenSR = Math.max(4, Math.round(sampleRate * 0.0067));
@@ -862,11 +916,13 @@ export class StreamingMatrixUpmix51 {
     this.tapEcho1SL = Math.max(2, Math.round(sampleRate * 0.036));
     this.tapEcho2SL = Math.max(3, Math.round(sampleRate * 0.062));
     this.ringSL = new Float32Array(this.tapEcho2SL + 1);
+    this.ringLenSL = this.ringSL.length;
 
     this.tapDirectSR = Math.max(1, Math.round(sampleRate * 0.022));
     this.tapEcho1SR = Math.max(2, Math.round(sampleRate * 0.044));
     this.tapEcho2SR = Math.max(3, Math.round(sampleRate * 0.074));
     this.ringSR = new Float32Array(this.tapEcho2SR + 1);
+    this.ringLenSR = this.ringSR.length;
 
     this.centerAmt = profile === 'direct-discrete' ? 1.1 : profile === 'ambient-hall' ? 0.96 : 1.05;
     this.vocalCancel = profile === 'direct-discrete' ? 0.99 : profile === 'ambient-hall' ? 0.92 : 0.97;
@@ -894,20 +950,22 @@ export class StreamingMatrixUpmix51 {
     const vMid = (lVocal + rVocal) * 0.5;
     const vSide = (lVocal - rVocal) * 0.5;
 
-    this.pwrL = this.pwrL * this.pwrSmooth + l * l * (1 - this.pwrSmooth);
-    this.pwrR = this.pwrR * this.pwrSmooth + r * r * (1 - this.pwrSmooth);
-    this.pwrCross = this.pwrCross * this.pwrSmooth + l * r * (1 - this.pwrSmooth);
+    const ps = this.pwrSmooth;
+    const pa = this.pwrAlpha;
+    this.pwrL = this.pwrL * ps + l * l * pa;
+    this.pwrR = this.pwrR * ps + r * r * pa;
+    this.pwrCross = this.pwrCross * ps + l * r * pa;
 
     const totalPwr = this.pwrL + this.pwrR + 1e-7;
     const corrNorm = Math.max(-1, Math.min(1, (2 * this.pwrCross) / totalPwr));
     const pwrM = 0.25 * (this.pwrL + this.pwrR + 2 * this.pwrCross);
     const pwrS = 0.25 * (this.pwrL + this.pwrR - 2 * this.pwrCross);
 
-    this.vPwrL = this.vPwrL * this.pwrSmooth + lVocal * lVocal * (1 - this.pwrSmooth);
-    this.vPwrR = this.vPwrR * this.pwrSmooth + rVocal * rVocal * (1 - this.pwrSmooth);
-    this.vPwrM = this.vPwrM * this.pwrSmooth + vMid * vMid * (1 - this.pwrSmooth);
-    this.vPwrS = this.vPwrS * this.pwrSmooth + vSide * vSide * (1 - this.pwrSmooth);
-    this.vPwrCross = this.vPwrCross * this.pwrSmooth + lVocal * rVocal * (1 - this.pwrSmooth);
+    this.vPwrL = this.vPwrL * ps + lVocal * lVocal * pa;
+    this.vPwrR = this.vPwrR * ps + rVocal * rVocal * pa;
+    this.vPwrM = this.vPwrM * ps + vMid * vMid * pa;
+    this.vPwrS = this.vPwrS * ps + vSide * vSide * pa;
+    this.vPwrCross = this.vPwrCross * ps + lVocal * rVocal * pa;
 
     const vTotalPwr = this.vPwrL + this.vPwrR + 1e-7;
     const vCorrNorm = Math.max(-1, Math.min(1, (2 * this.vPwrCross) / vTotalPwr));
@@ -963,30 +1021,44 @@ export class StreamingMatrixUpmix51 {
     const apDelayedSL = this.apBufSL[this.apIdxSL];
     const apOutSL = apDelayedSL - this.apGain * this.slLpY;
     this.apBufSL[this.apIdxSL] = this.slLpY + this.apGain * apOutSL;
-    this.apIdxSL = (this.apIdxSL + 1) % this.apLenSL;
+    if (++this.apIdxSL >= this.apLenSL) this.apIdxSL = 0;
 
     const apDelayedSR = this.apBufSR[this.apIdxSR];
     const apOutSR = apDelayedSR - this.apGain * this.srLpY;
     this.apBufSR[this.apIdxSR] = this.srLpY + this.apGain * apOutSR;
-    this.apIdxSR = (this.apIdxSR + 1) % this.apLenSR;
+    if (++this.apIdxSR >= this.apLenSR) this.apIdxSR = 0;
 
-    this.ringSL[this.idxSL] = apOutSL;
-    const slDirect = this.ringSL[(this.idxSL - this.tapDirectSL + this.ringSL.length) % this.ringSL.length];
-    const slEchoRaw =
-      this.ringSL[(this.idxSL - this.tapEcho1SL + this.ringSL.length) % this.ringSL.length] * 0.36 +
-      this.ringSL[(this.idxSL - this.tapEcho2SL + this.ringSL.length) % this.ringSL.length] * 0.22;
+    const rLenSL = this.ringLenSL;
+    let iSL = this.idxSL;
+    this.ringSL[iSL] = apOutSL;
+    let tDirL = iSL - this.tapDirectSL;
+    if (tDirL < 0) tDirL += rLenSL;
+    let tE1L = iSL - this.tapEcho1SL;
+    if (tE1L < 0) tE1L += rLenSL;
+    let tE2L = iSL - this.tapEcho2SL;
+    if (tE2L < 0) tE2L += rLenSL;
+    const slDirect = this.ringSL[tDirL];
+    const slEchoRaw = this.ringSL[tE1L] * 0.36 + this.ringSL[tE2L] * 0.22;
     this.slEchoDampY = this.slEchoDampY + this.alphaEchoDamp * (slEchoRaw - this.slEchoDampY);
     const surroundOutSL = slDirect * 0.88 + this.slEchoDampY;
-    this.idxSL = (this.idxSL + 1) % this.ringSL.length;
+    if (++iSL >= rLenSL) iSL = 0;
+    this.idxSL = iSL;
 
-    this.ringSR[this.idxSR] = apOutSR;
-    const srDirect = this.ringSR[(this.idxSR - this.tapDirectSR + this.ringSR.length) % this.ringSR.length];
-    const srEchoRaw =
-      this.ringSR[(this.idxSR - this.tapEcho1SR + this.ringSR.length) % this.ringSR.length] * 0.36 +
-      this.ringSR[(this.idxSR - this.tapEcho2SR + this.ringSR.length) % this.ringSR.length] * 0.22;
+    const rLenSR = this.ringLenSR;
+    let iSR = this.idxSR;
+    this.ringSR[iSR] = apOutSR;
+    let tDirR = iSR - this.tapDirectSR;
+    if (tDirR < 0) tDirR += rLenSR;
+    let tE1R = iSR - this.tapEcho1SR;
+    if (tE1R < 0) tE1R += rLenSR;
+    let tE2R = iSR - this.tapEcho2SR;
+    if (tE2R < 0) tE2R += rLenSR;
+    const srDirect = this.ringSR[tDirR];
+    const srEchoRaw = this.ringSR[tE1R] * 0.36 + this.ringSR[tE2R] * 0.22;
     this.srEchoDampY = this.srEchoDampY + this.alphaEchoDamp * (srEchoRaw - this.srEchoDampY);
     const surroundOutSR = srDirect * 0.88 + this.srEchoDampY;
-    this.idxSR = (this.idxSR + 1) % this.ringSR.length;
+    if (++iSR >= rLenSR) iSR = 0;
+    this.idxSR = iSR;
 
     this.out0 = frontL * this.gains.FL;
     this.out1 = frontR * this.gains.FR;
@@ -1508,11 +1580,24 @@ export class Streaming8DBinaural {
   private subBassState = 0;
 
   private readonly dt: number;
+  private readonly twoPiDt: number;
   private readonly maxItdSamples: number;
   private readonly subAlpha: number;
+  private readonly invOrbitSamples: number;
+  private readonly verbLen: number;
   private sampleIndex = 0;
   private outL = 0;
   private outR = 0;
+
+  private ctrlCountdown8d = 0;
+  private cachedGainL = 0.7071;
+  private cachedGainR = 0.7071;
+  private cachedPresence = 1;
+  private cachedDelayL = 0;
+  private cachedDelayR = 0;
+  private cachedAlphaL = 0.5;
+  private cachedAlphaR = 0.5;
+  private cachedCenterWeight = 0.28;
 
   constructor(options: Binaural8DOptions = {}) {
     this.sampleRate = options.sampleRate ?? 48000;
@@ -1529,16 +1614,22 @@ export class Streaming8DBinaural {
     this.tap3Len = Math.max(8, Math.round(this.sampleRate * 0.047));
     this.verbBufL = new Float32Array(this.tap3Len + 1);
     this.verbBufR = new Float32Array(this.tap3Len + 1);
+    this.verbLen = this.verbBufL.length;
 
     this.dt = 1 / this.sampleRate;
+    this.twoPiDt = 2 * Math.PI * this.dt;
     this.maxItdSamples = this.sampleRate * 0.00062;
     this.subAlpha = this.dt / (1 / (2 * Math.PI * 115) + this.dt);
+    this.invOrbitSamples = 1 / (this.sampleRate * this.orbitPeriodSec);
   }
 
   private readItd(buf: Float32Array, d: number): number {
-    const idx0 = (this.itdWrite - Math.floor(d) + this.itdBufLen) % this.itdBufLen;
-    const idx1 = (idx0 - 1 + this.itdBufLen) % this.itdBufLen;
-    const frac = d - Math.floor(d);
+    const intD = d | 0;
+    let idx0 = this.itdWrite - intD;
+    if (idx0 < 0) idx0 += this.itdBufLen;
+    let idx1 = idx0 - 1;
+    if (idx1 < 0) idx1 += this.itdBufLen;
+    const frac = d - intD;
     return buf[idx0] * (1 - frac) + buf[idx1] * frac;
   }
 
@@ -1554,42 +1645,56 @@ export class Streaming8DBinaural {
     this.itdBufL[this.itdWrite] = srcL;
     this.itdBufR[this.itdWrite] = srcR;
 
-    const progress = this.sampleIndex / (this.sampleRate * this.orbitPeriodSec);
+    if (this.ctrlCountdown8d === 0) {
+      this.ctrlCountdown8d = 7;
+      const progress = this.sampleIndex * this.invOrbitSamples;
+      const azimuthDeg = get8dAzimuthDegrees(progress);
+      const azimuthRad = (azimuthDeg * Math.PI) / 180;
+      const pan = Math.sin(azimuthRad);
+      const depth = Math.cos(azimuthRad);
+
+      const panHalfAngle = (pan + 1) * 0.25 * Math.PI;
+      this.cachedGainL = Math.cos(panHalfAngle);
+      this.cachedGainR = Math.sin(panHalfAngle);
+
+      const rearDepthNorm = (depth + 1) * 0.5;
+      this.cachedPresence = 0.82 + 0.18 * rearDepthNorm;
+
+      this.cachedDelayL = pan > 0 ? pan * this.maxItdSamples : 0;
+      this.cachedDelayR = pan < 0 ? -pan * this.maxItdSamples : 0;
+
+      const rearCutoff = 3800 + 11700 * rearDepthNorm;
+      const cutoffL = Math.max(2400, rearCutoff - (pan > 0 ? pan * 1800 : 0));
+      const cutoffR = Math.max(2400, rearCutoff - (pan < 0 ? -pan * 1800 : 0));
+
+      const wcL = this.twoPiDt * cutoffL;
+      const wcR = this.twoPiDt * cutoffR;
+      this.cachedAlphaL = wcL / (1 + wcL);
+      this.cachedAlphaR = wcR / (1 + wcR);
+      this.cachedCenterWeight = depth > 0 ? depth * 0.28 : 0;
+    } else {
+      this.ctrlCountdown8d--;
+    }
     this.sampleIndex++;
 
-    const azimuthDeg = get8dAzimuthDegrees(progress);
-    const azimuthRad = (azimuthDeg * Math.PI) / 180;
-    const pan = Math.sin(azimuthRad);
-    const depth = Math.cos(azimuthRad);
+    const delayedL = this.readItd(this.itdBufL, this.cachedDelayL);
+    const delayedR = this.readItd(this.itdBufR, this.cachedDelayR);
+    if (++this.itdWrite >= this.itdBufLen) this.itdWrite = 0;
 
-    const panNorm = (pan + 1) * 0.5;
-    const gainL = Math.cos(panNorm * Math.PI * 0.5);
-    const gainR = Math.sin(panNorm * Math.PI * 0.5);
+    const pres = this.cachedPresence;
+    this.pinnaStateL =
+      this.pinnaStateL + this.cachedAlphaL * (delayedL * this.cachedGainL * pres - this.pinnaStateL);
+    this.pinnaStateR =
+      this.pinnaStateR + this.cachedAlphaR * (delayedR * this.cachedGainR * pres - this.pinnaStateR);
 
-    const rearDepthNorm = (depth + 1) * 0.5;
-    const presenceGain = 0.82 + 0.18 * rearDepthNorm;
-
-    const delaySamplesL = Math.max(0, pan) * this.maxItdSamples;
-    const delaySamplesR = Math.max(0, -pan) * this.maxItdSamples;
-
-    const delayedL = this.readItd(this.itdBufL, delaySamplesL);
-    const delayedR = this.readItd(this.itdBufR, delaySamplesR);
-    this.itdWrite = (this.itdWrite + 1) % this.itdBufLen;
-
-    const rearCutoff = 3800 + 11700 * rearDepthNorm;
-    const cutoffL = Math.max(2400, rearCutoff - Math.max(0, pan) * 1800);
-    const cutoffR = Math.max(2400, rearCutoff - Math.max(0, -pan) * 1800);
-
-    const alphaL = this.dt / (1 / (2 * Math.PI * cutoffL) + this.dt);
-    const alphaR = this.dt / (1 / (2 * Math.PI * cutoffR) + this.dt);
-
-    this.pinnaStateL = this.pinnaStateL + alphaL * (delayedL * gainL * presenceGain - this.pinnaStateL);
-    this.pinnaStateR = this.pinnaStateR + alphaR * (delayedR * gainR * presenceGain - this.pinnaStateR);
-
-    const vLen = this.verbBufL.length;
-    const idx1 = (this.verbIdx - this.tap1Len + vLen) % vLen;
-    const idx2 = (this.verbIdx - this.tap2Len + vLen) % vLen;
-    const idx3 = (this.verbIdx - this.tap3Len + vLen) % vLen;
+    const vLen = this.verbLen;
+    const vIdx = this.verbIdx;
+    let idx1 = vIdx - this.tap1Len;
+    if (idx1 < 0) idx1 += vLen;
+    let idx2 = vIdx - this.tap2Len;
+    if (idx2 < 0) idx2 += vLen;
+    let idx3 = vIdx - this.tap3Len;
+    if (idx3 < 0) idx3 += vLen;
 
     const reflL = this.verbBufL[idx1] * 0.45 + this.verbBufR[idx2] * 0.32 + this.verbBufL[idx3] * 0.23;
     const reflR = this.verbBufR[idx1] * 0.45 + this.verbBufL[idx2] * 0.32 + this.verbBufR[idx3] * 0.23;
@@ -1597,12 +1702,11 @@ export class Streaming8DBinaural {
     this.reverbDampL = this.reverbDampL * 0.68 + reflL * 0.32;
     this.reverbDampR = this.reverbDampR * 0.68 + reflR * 0.32;
 
-    this.verbBufL[this.verbIdx] = Math.max(-1, Math.min(1, this.pinnaStateL * 0.55 + this.reverbDampR * 0.34));
-    this.verbBufR[this.verbIdx] = Math.max(-1, Math.min(1, this.pinnaStateR * 0.55 + this.reverbDampL * 0.34));
-    this.verbIdx = (this.verbIdx + 1) % vLen;
+    this.verbBufL[vIdx] = Math.max(-1, Math.min(1, this.pinnaStateL * 0.55 + this.reverbDampR * 0.34));
+    this.verbBufR[vIdx] = Math.max(-1, Math.min(1, this.pinnaStateR * 0.55 + this.reverbDampL * 0.34));
+    this.verbIdx = vIdx + 1 >= vLen ? 0 : vIdx + 1;
 
-    const centerProximity = Math.max(0, depth);
-    const centerBlend = mono * centerProximity * 0.28;
+    const centerBlend = mono * this.cachedCenterWeight;
 
     this.outL =
       this.pinnaStateL * 1.12 +

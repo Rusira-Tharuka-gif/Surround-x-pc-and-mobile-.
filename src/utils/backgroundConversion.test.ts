@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildConversionNotificationCopy,
+  computeConversionTelemetry,
   createAbortError,
   isAbortError,
   parseJobSnapshot,
@@ -112,4 +113,18 @@ test('createAbortError and isAbortError identify cancelled conversions accuratel
   assert.equal(isAbortError(abortErr), true);
   assert.equal(isAbortError(new Error('FFmpeg crash')), false);
   assert.equal(isAbortError(null), false);
+});
+
+test('computeConversionTelemetry formats elapsed and remaining ETA cleanly', () => {
+  const early = computeConversionTelemetry(6, 300);
+  assert.equal(early.elapsedLabel, '0:00');
+  assert.equal(early.etaLabel, 'Estimating...');
+
+  const mid = computeConversionTelemetry(50, 4000);
+  assert.equal(mid.elapsedLabel, '0:04');
+  assert.equal(mid.etaLabel, '~0:04 left');
+
+  const done = computeConversionTelemetry(100, 2450);
+  assert.equal(done.elapsedLabel, '0:02');
+  assert.equal(done.etaLabel, '2.5s total');
 });

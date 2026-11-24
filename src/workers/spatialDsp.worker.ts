@@ -21,9 +21,17 @@ interface WorkerProcessPayload {
   emitRawStereoPcm?: boolean;
 }
 
+interface WorkerProcessFloatPayload {
+  leftBuffer: ArrayBuffer;
+  rightBuffer: ArrayBuffer;
+  applyEndFade: boolean;
+  emitRawStereoPcm?: boolean;
+}
+
 type WorkerRequest =
   | { id: number; type: 'init'; payload: WorkerInitPayload }
   | { id: number; type: 'processChunk'; payload: WorkerProcessPayload }
+  | { id: number; type: 'processFloatChunk'; payload: WorkerProcessFloatPayload }
   | { id: number; type: 'finish' };
 
 let sessionMode: '5.1' | '8d' = '5.1';
@@ -80,6 +88,62 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
       }
 
       self.postMessage({ id, ok: true });
+      return;
+    }
+
+    if (type === 'processFloatChunk') {
+      const { leftBuffer, rightBuffer, applyEndFade, emitRawStereoPcm } = event.data.payload;
+      const left = new Float32Array(leftBuffer);
+      const right = new Float32Array(rightBuffer);
+      const frameCount = Math.min(left.length, right.length);
+
+      if (frameCount === 0) {
+        const empty = new Uint8Array(0);
+        workerScope.postMessage({ id, ok: true, result: { outBuffer: empty.buffer, byteLength: 0 } }, [
+          empty.buffer,
+        ]);
+        return;
+      }
+
+      totalProcessedFrames += frameCount;
+
+      if (sessionMode === '8d') {
+        if (!session8d) {
+          throw new Error('8D binaural processor not initialized in DSP worker.');
+        }
+        const outBytes = session8d.processRangeToPcm16Bytes(
+          left,
+          right,
+          0,
+          frameCount,
+          !emitRawStereoPcm,
+          applyEndFade,
+        );
+        const outBuf = outBytes.buffer as ArrayBuffer;
+        workerScope.postMessage(
+          { id, ok: true, result: { outBuffer: outBuf, byteLength: outBytes.byteLength } },
+          [outBuf],
+        );
+        return;
+      }
+
+      if (!sessionUpmix) {
+        throw new Error('5.1 matrix processor not initialized in DSP worker.');
+      }
+      const wavOut = sessionUpmix.processRangeToWavBytes(
+        left,
+        right,
+        0,
+        frameCount,
+        sessionSampleRate,
+        sumSq,
+        applyEndFade,
+      );
+      const outBuf = wavOut.buffer as ArrayBuffer;
+      workerScope.postMessage(
+        { id, ok: true, result: { outBuffer: outBuf, byteLength: wavOut.byteLength } },
+        [outBuf],
+      );
       return;
     }
 

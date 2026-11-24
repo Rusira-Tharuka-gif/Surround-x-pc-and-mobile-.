@@ -147,6 +147,49 @@ export function shouldEmitProgressUpdate(params: {
   return false;
 }
 
+export function formatElapsedCompact(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+export interface ConversionTelemetry {
+  elapsedLabel: string;
+  etaLabel: string;
+}
+
+export function computeConversionTelemetry(
+  progressPct: number,
+  elapsedMs: number,
+): ConversionTelemetry {
+  const safeElapsed = Math.max(0, elapsedMs);
+  const elapsedLabel = formatElapsedCompact(safeElapsed);
+
+  if (progressPct >= 100) {
+    return {
+      elapsedLabel,
+      etaLabel: `${(safeElapsed / 1000).toFixed(1)}s total`,
+    };
+  }
+
+  if (progressPct < 12 || safeElapsed < 600) {
+    return {
+      elapsedLabel,
+      etaLabel: 'Estimating...',
+    };
+  }
+
+  const remainingMs = Math.max(0, (safeElapsed * (100 - progressPct)) / progressPct);
+  const remSec = Math.max(1, Math.ceil(remainingMs / 1000));
+  const remMins = Math.floor(remSec / 60);
+  const remSecs = remSec % 60;
+  return {
+    elapsedLabel,
+    etaLabel: `~${remMins}:${remSecs.toString().padStart(2, '0')} left`,
+  };
+}
+
 export function serializeJobSnapshot(snapshot: JobSnapshot): string {
   return JSON.stringify(snapshot);
 }

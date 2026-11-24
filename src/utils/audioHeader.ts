@@ -173,6 +173,30 @@ export function computeChunkWindows(
 }
 
 /**
+ * Chooses a frame-aligned chunk duration (multiples of 4s @ 48 kHz = exact multiples of
+ * 1,536 AC3 frames and 512 DTS frames). Small/medium files (e.g. ~4 MB songs) use fewer,
+ * larger chunks to eliminate per-chunk FFmpeg startup and seeking overhead, while large
+ * tracks stay capped at 20s chunks (< 25 MB peak RAM).
+ */
+export function computeAdaptiveChunkDurationSec(
+  sourceSizeBytes: number,
+  durationSec: number,
+  isDiscrete6Ch = false,
+): number {
+  const mb = sourceSizeBytes / (1024 * 1024);
+  if (isDiscrete6Ch) {
+    return durationSec > 0 && durationSec <= 120 && mb <= 24 ? 40 : 20;
+  }
+  if (mb <= 18 && durationSec > 0 && durationSec <= 240) {
+    return 60;
+  }
+  if (mb <= 32 && durationSec > 0 && durationSec <= 360) {
+    return 40;
+  }
+  return 20;
+}
+
+/**
  * Writes a valid 44-byte RIFF/WAVE PCM16 stereo header for assembled multi-chunk 8D WAV blobs.
  */
 export function buildStereoWavHeaderBytes(pcmDataBytes: number, sampleRate = 48000): Uint8Array {

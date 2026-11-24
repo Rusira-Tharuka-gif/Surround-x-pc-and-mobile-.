@@ -32,10 +32,11 @@ import {
   isSupportedAudioFile,
   type TrackEnergyFrame,
 } from '../utils/channelMath';
-import { convertAudioToAc3 } from '../utils/ffmpegConverter';
+import { convertAudioToAc3, warmupFfmpegEngine } from '../utils/ffmpegConverter';
 import {
   backgroundConversionManager,
   clearJobSnapshot,
+  computeConversionTelemetry,
   getRuntimeEnvironmentLabel,
   isAbortError,
   type ConversionAlertState,
@@ -125,6 +126,7 @@ export function ConverterStudio({
 
   const [phase, setPhase] = useState<ConversionPhase>('idle');
   const [progressPct, setProgressPct] = useState(0);
+  const [conversionElapsedMs, setConversionElapsedMs] = useState(0);
   const [conversionLogs, setConversionLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [conversionResult, setConversionResult] = useState<ConversionResult | null>(null);
@@ -139,6 +141,7 @@ export function ConverterStudio({
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeJobIdRef = useRef<string | null>(null);
   const currentPhaseRef = useRef<ConversionPhase>('idle');
+  const conversionStartedAtRef = useRef<number>(0);
   const runtimeEnv = getRuntimeEnvironmentLabel();
 
   // Initialize Web Audio Stage Player once
@@ -231,6 +234,7 @@ export function ConverterStudio({
             sourceChannels: streamInfo.sourceChannels,
             isDemo,
           });
+          warmupFfmpegEngine();
         }
       } catch (err) {
         if (err instanceof Error && err.message === 'Track load superseded') return;
@@ -374,6 +378,8 @@ export function ConverterStudio({
     setAlertToast(null);
     setConversionLogs([]);
     setProgressPct(0);
+    setConversionElapsedMs(0);
+    conversionStartedAtRef.current = performance.now();
     if (resultUrlRef.current) {
       URL.revokeObjectURL(resultUrlRef.current);
       resultUrlRef.current = null;
@@ -416,7 +422,7 @@ export function ConverterStudio({
           setPhase(nextPhase);
         },
         onProgress: (pct) => {
-          setProgressPct(pct);
+          setProgressPct((prev) => (prev === pct ? prev : pct));
           backgroundConversionManager.updateProgress({
             jobId,
             filename: trackMeta.name,
@@ -430,6 +436,7 @@ export function ConverterStudio({
         },
       });
 
+      setConversionElapsedMs(result.elapsedMs);
       resultUrlRef.current = result.url;
       setConversionResult(result);
       const completedAlert = backgroundConversionManager.completeJob({
@@ -479,6 +486,18 @@ export function ConverterStudio({
     phase === 'processing-8d' ||
     phase === 'encoding-ac3' ||
     phase === 'encoding-output';
+
+  useEffect(() => {
+    if (!isConverting) return;
+    const timer = window.setInterval(() => {
+      if (conversionStartedAtRef.current > 0) {
+        setConversionElapsedMs(Math.max(0, Math.round(performance.now() - conversionStartedAtRef.current)));
+      }
+    }, 450);
+    return () => window.clearInterval(timer);
+  }, [isConverting]);
+
+  const progressTelemetry = computeConversionTelemetry(progressPct, conversionElapsedMs);
 
   const activityMode: StageActivityMode = activeSweepChannel
     ? 'sweeping'
@@ -1035,6 +1054,12 @@ export function ConverterStudio({
                       {PHASE_LABELS[phase]}
                     </span>
                     <div className="flex items-center gap-2 shrink-0">
+                      <span
+                        className="font-mono tabular-nums text-[11px] text-slate-300"
+                        data-testid="conversion-telemetry"
+                      >
+                        {progressTelemetry.elapsedLabel} · {progressTelemetry.etaLabel}
+                      </span>
                       <span className="font-mono tabular-nums text-cyan-300 font-semibold">
                         {progressPct}%
                       </span>

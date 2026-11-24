@@ -510,6 +510,20 @@ test('5.1 AC3 and DTS bounded streaming chunks align to exact codec frame bounda
   for (let ch = 0; ch < 6; ch++) {
     assert.ok(sumSq[ch] > 0, `Channel ${ch} should have accumulated energy`);
   }
+
+  // Verify bit-identical 6-channel sample continuity between single-pass vs chunked upmix
+  const singlePass = new StreamingMatrixUpmix51(defaultGains, 'cinema-pro', sr);
+  const singleWav = singlePass.processRangeToWavBytes(left, right, 0, totalFrames, sr, new Float64Array(6), true);
+  const decSingle = decodePcmWavToChannels(singleWav);
+
+  for (let ch = 0; ch < 6; ch++) {
+    for (let f = 0; f < chunk1Frames; f++) {
+      assert.equal(dec1.channels[ch][f], decSingle.channels[ch][f]);
+    }
+    for (let f = 0; f < chunk2Frames; f++) {
+      assert.equal(dec2.channels[ch][f], decSingle.channels[ch][chunk1Frames + f]);
+    }
+  }
 });
 
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildFfmpegChunkDecodeArgs,
   buildStereoWavHeaderBytes,
+  computeAdaptiveChunkDurationSec,
   computeChunkWindows,
   parseAudioHeaderBytes,
 } from './audioHeader';
@@ -77,4 +78,19 @@ test('buildStereoWavHeaderBytes and buildFfmpegChunkDecodeArgs produce valid out
     inputExt: 'mp3',
   });
   assert.equal(mp3Args.indexOf('-ss') > mp3Args.indexOf('-i'), true);
+});
+
+test('computeAdaptiveChunkDurationSec picks fast frame-aligned windows for small files and 20s for large files', () => {
+  const smallChunk = computeAdaptiveChunkDurationSec(4 * 1024 * 1024, 180, false);
+  assert.equal(smallChunk, 60);
+  assert.equal((smallChunk * 48000) % 1536, 0);
+  assert.equal((smallChunk * 48000) % 512, 0);
+
+  const mediumChunk = computeAdaptiveChunkDurationSec(25 * 1024 * 1024, 300, false);
+  assert.equal(mediumChunk, 40);
+  assert.equal((mediumChunk * 48000) % 1536, 0);
+  assert.equal((mediumChunk * 48000) % 512, 0);
+
+  const largeChunk = computeAdaptiveChunkDurationSec(120 * 1024 * 1024, 1200, false);
+  assert.equal(largeChunk, 20);
 });
