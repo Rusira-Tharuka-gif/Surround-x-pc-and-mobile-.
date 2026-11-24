@@ -42,10 +42,13 @@ public class BackgroundConversionService extends Service {
 
     private static final long WAKELOCK_TIMEOUT_MS = 45L * 60L * 1000L;
 
+    private static String lastAlertedJobId = "";
+
     private PowerManager.WakeLock wakeLock;
     private boolean isConversionActive = false;
     private String activeJobId = "";
-    private String lastAlertedJobId = "";
+    private int lastDisplayedProgress = -1;
+    private String lastDisplayedPhase = "";
     private Bitmap largeIconBitmap = null;
 
     @Override
@@ -79,6 +82,8 @@ public class BackgroundConversionService extends Service {
             String filename = nonEmpty(intent.getStringExtra(EXTRA_FILENAME), "Audio Track");
             String phaseLabel = nonEmpty(intent.getStringExtra(EXTRA_PHASE_LABEL), "Converting in background...");
             int progress = clampProgress(intent.getIntExtra(EXTRA_PROGRESS, 0));
+            lastDisplayedProgress = progress;
+            lastDisplayedPhase = phaseLabel;
 
             Notification notification = buildSilentProgressNotification(filename, phaseLabel, progress);
             int serviceType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
@@ -90,6 +95,8 @@ public class BackgroundConversionService extends Service {
 
         if (ACTION_UPDATE.equals(action)) {
             if (!isConversionActive) {
+                stopForegroundAndCancelProgress();
+                stopSelf();
                 return START_NOT_STICKY;
             }
             if (!jobId.isEmpty() && !activeJobId.isEmpty() && !jobId.equals(activeJobId)) {
@@ -99,6 +106,12 @@ public class BackgroundConversionService extends Service {
             String filename = nonEmpty(intent.getStringExtra(EXTRA_FILENAME), "Audio Track");
             String phaseLabel = nonEmpty(intent.getStringExtra(EXTRA_PHASE_LABEL), "Converting in background...");
             int progress = clampProgress(intent.getIntExtra(EXTRA_PROGRESS, 0));
+
+            if (progress == lastDisplayedProgress && phaseLabel.equals(lastDisplayedPhase)) {
+                return START_NOT_STICKY;
+            }
+            lastDisplayedProgress = progress;
+            lastDisplayedPhase = phaseLabel;
 
             NotificationManager manager = getNotificationManager();
             if (manager != null) {
@@ -217,6 +230,7 @@ public class BackgroundConversionService extends Service {
             .setDefaults(0)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(launchIntent);
 
