@@ -23,6 +23,8 @@ import {
   sanitizeInputExtension,
 } from './channelMath';
 
+import { createAbortError, isAbortError } from './backgroundConversion';
+
 let ffmpegSingleton: FFmpeg | null = null;
 let loadPromise: Promise<FFmpeg> | null = null;
 let conversionInFlight = false;
@@ -30,6 +32,21 @@ let conversionInFlight = false;
 const TARGET_SAMPLE_RATE = 48000;
 const CHUNK_DURATION_SEC = 20;
 const MAX_DURATION_SEC = 1800; // 30 minutes via streaming 20s chunks
+
+function yieldToEventLoop(): Promise<void> {
+  if (typeof MessageChannel !== 'undefined') {
+    return new Promise((resolve) => {
+      const mc = new MessageChannel();
+      mc.port1.onmessage = () => {
+        mc.port1.close();
+        mc.port2.close();
+        resolve();
+      };
+      mc.port2.postMessage(null);
+    });
+  }
+  return Promise.resolve();
+}
 
 export interface ConvertOptions {
   sourceFile?: File | Blob;
@@ -43,6 +60,7 @@ export interface ConvertOptions {
   bitrateKbps: Ac3BitrateKbps;
   channels: ChannelConfig[];
   upmixProfile: UpmixProfile;
+  signal?: AbortSignal;
   onPhaseChange?: (phase: ConversionPhase) => void;
   onProgress?: (percent: number) => void;
   onLog?: (line: string) => void;
@@ -288,10 +306,15 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     bitrateKbps,
     channels,
     upmixProfile,
+    signal,
     onPhaseChange,
     onProgress,
     onLog,
   } = options;
+
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
 
   const hasValidFile = sourceFile && sourceFile.size > 0;
   const hasValidBytes = sourceBytes && sourceBytes.byteLength > 0;
@@ -346,7 +369,25 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     instance?.off('log', ffmpegLogListener);
   };
 
+  let abortListener: (() => void) | null = null;
+
+  const throwIfCancelled = () => {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
+  };
+
   try {
+    abortListener = () => {
+      try {
+        dspWorker?.terminate();
+      } catch {
+        // Ignore worker termination error
+      }
+      resetFfmpegWorker();
+    };
+    signal?.addEventListener('abort', abortListener, { once: true });
+
     onPhaseChange?.('loading-engine');
     emitProgress(4);
     pushStatus(
@@ -356,6 +397,7 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     );
 
     ffmpeg = await getLoadedFfmpeg();
+    throwIfCancelled();
     attachFfmpegListeners(ffmpeg);
     dspWorker = new DspWorkerClient();
 
@@ -464,6 +506,7 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     let totalRawPcmBytes = 0;
 
     for (let i = 0; i < windows.length; i++) {
+      throwIfCancelled();
       const win = windows[i];
       const isLast = i === windows.length - 1;
       const decodeDur = isLast ? win.durationSec + 8 : win.durationSec;
@@ -584,7 +627,10 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
 
       const progressSpan = exportFormat === 'flac' ? 68 : 78;
       emitProgress(16 + ((i + 1) / windows.length) * progressSpan);
+      // Yield cleanly via MessageChannel (never clamped to 1s in background) so UI & Cancel stay responsive
+      await yieldToEventLoop();
     }
+    throwIfCancelled();
 
     onPhaseChange?.('encoding-output');
 
@@ -689,6 +735,11 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
       statusLogs,
     };
   } catch (err) {
+    if (signal?.aborted || isAbortError(err)) {
+      resetFfmpegWorker();
+      onPhaseChange?.('idle');
+      throw createAbortError();
+    }
     if (isMemoryAllocationError(err)) {
       resetFfmpegWorker();
     }
@@ -697,6 +748,9 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     const friendlyMessage = formatFriendlyError(err, recentLogs);
     throw new Error(friendlyMessage);
   } finally {
+    if (abortListener) {
+      signal?.removeEventListener('abort', abortListener);
+    }
     dspWorker?.terminate();
     detachFfmpegListeners(ffmpeg);
     if (ffmpeg) {

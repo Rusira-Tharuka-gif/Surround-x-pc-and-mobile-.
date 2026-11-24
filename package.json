@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js release dist-electron",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/utils/channelMath.test.ts src/utils/waveMath.test.ts src/utils/audioHeader.test.ts",
+    "test": "tsx --test src/utils/channelMath.test.ts src/utils/waveMath.test.ts src/utils/audioHeader.test.ts src/utils/backgroundConversion.test.ts",
     "cap:sync": "npm run build && npx cap sync android",
     "electron:dev": "node electron/dev.mjs",
     "electron:start": "npm run build && electron .",

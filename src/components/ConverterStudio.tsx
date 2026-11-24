@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
 import {
   AlertCircle,
+  BellRing,
   CheckCircle2,
   Download,
   FileAudio,
@@ -32,6 +33,13 @@ import {
   type TrackEnergyFrame,
 } from '../utils/channelMath';
 import { convertAudioToAc3 } from '../utils/ffmpegConverter';
+import {
+  backgroundConversionManager,
+  clearJobSnapshot,
+  getRuntimeEnvironmentLabel,
+  isAbortError,
+  type ConversionAlertState,
+} from '../utils/backgroundConversion';
 import {
   StageAudioPlayer,
   ZERO_LEVELS,
@@ -120,6 +128,7 @@ export function ConverterStudio({
   const [conversionLogs, setConversionLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [conversionResult, setConversionResult] = useState<ConversionResult | null>(null);
+  const [alertToast, setAlertToast] = useState<ConversionAlertState | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const playerRef = useRef<StageAudioPlayer | null>(null);
@@ -127,6 +136,10 @@ export function ConverterStudio({
   const toneTimerRef = useRef<number | null>(null);
   const resultUrlRef = useRef<string | null>(null);
   const lastAngleEmitRef = useRef<number>(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const activeJobIdRef = useRef<string | null>(null);
+  const currentPhaseRef = useRef<ConversionPhase>('idle');
+  const runtimeEnv = getRuntimeEnvironmentLabel();
 
   // Initialize Web Audio Stage Player once
   useEffect(() => {
@@ -158,6 +171,7 @@ export function ConverterStudio({
     playerRef.current = player;
 
     return () => {
+      abortControllerRef.current?.abort();
       if (sweepTimerRef.current !== null) {
         window.clearTimeout(sweepTimerRef.current);
       }
@@ -180,7 +194,10 @@ export function ConverterStudio({
     async (fileOrBlob: File | Blob, name: string, mimeType: string, isDemo = false) => {
       try {
         setErrorMessage(null);
+        setAlertToast(null);
+        clearJobSnapshot();
         setPhase('idle');
+        currentPhaseRef.current = 'idle';
         setProgressPct(0);
         setConversionLogs([]);
         setIsLoadingTrack(true);
@@ -341,6 +358,12 @@ export function ConverterStudio({
     step();
   };
 
+  const handleCancelConversion = () => {
+    if (!abortControllerRef.current) return;
+    setConversionLogs((prev) => [...prev.slice(-4), 'Cancelling conversion and releasing buffers...']);
+    abortControllerRef.current.abort();
+  };
+
   const handleConvert = async () => {
     if (!sourceFile || !trackMeta) {
       setErrorMessage('Please upload an audio file or load the demo stereo track first.');
@@ -348,6 +371,7 @@ export function ConverterStudio({
     }
 
     setErrorMessage(null);
+    setAlertToast(null);
     setConversionLogs([]);
     setProgressPct(0);
     if (resultUrlRef.current) {
@@ -355,6 +379,24 @@ export function ConverterStudio({
       resultUrlRef.current = null;
     }
     setConversionResult(null);
+
+    const jobId = `job_${Date.now().toString(36)}`;
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    activeJobIdRef.current = jobId;
+    currentPhaseRef.current = 'loading-engine';
+
+    const formatLabel =
+      exportFormat === '8d-spatial'
+        ? `8D Spatial (.${spatialContainer})`
+        : `5.1 ${exportFormat.toUpperCase()}`;
+
+    backgroundConversionManager.startJob({
+      jobId,
+      filename: trackMeta.name,
+      formatLabel,
+      phaseLabel: PHASE_LABELS['loading-engine'],
+    });
 
     try {
       const result = await convertAudioToAc3({
@@ -368,8 +410,21 @@ export function ConverterStudio({
         bitrateKbps,
         channels,
         upmixProfile,
-        onPhaseChange: setPhase,
-        onProgress: setProgressPct,
+        signal: controller.signal,
+        onPhaseChange: (nextPhase) => {
+          currentPhaseRef.current = nextPhase;
+          setPhase(nextPhase);
+        },
+        onProgress: (pct) => {
+          setProgressPct(pct);
+          backgroundConversionManager.updateProgress({
+            jobId,
+            filename: trackMeta.name,
+            formatLabel,
+            phaseLabel: PHASE_LABELS[currentPhaseRef.current] || 'Processing audio...',
+            progressPct: pct,
+          });
+        },
         onLog: (line) => {
           setConversionLogs((prev) => [...prev.slice(-5), line]);
         },
@@ -377,12 +432,44 @@ export function ConverterStudio({
 
       resultUrlRef.current = result.url;
       setConversionResult(result);
+      const completedAlert = backgroundConversionManager.completeJob({
+        jobId,
+        filename: trackMeta.name,
+        outputFilename: result.outputFilename,
+        formatLabel: result.codecLabel,
+        sizeLabel: formatFileSize(result.sizeBytes),
+      });
+      setAlertToast(completedAlert);
     } catch (err) {
-      setErrorMessage(
+      const cancelled = controller.signal.aborted || isAbortError(err);
+      const msg =
         err instanceof Error
           ? err.message
-          : 'Audio conversion failed. Please verify the file and try again.',
-      );
+          : 'Audio conversion failed. Please verify the file and try again.';
+
+      const failAlert = backgroundConversionManager.failJob({
+        jobId,
+        filename: trackMeta.name,
+        errorMessage: msg,
+        cancelled,
+      });
+
+      if (cancelled) {
+        currentPhaseRef.current = 'idle';
+        setPhase('idle');
+        setProgressPct(0);
+        setConversionLogs((prev) => [...prev.slice(-4), 'Conversion cancelled cleanly.']);
+      } else {
+        setErrorMessage(msg);
+      }
+      setAlertToast(failAlert);
+    } finally {
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      if (activeJobIdRef.current === jobId) {
+        activeJobIdRef.current = null;
+      }
     }
   };
 
@@ -405,6 +492,74 @@ export function ConverterStudio({
 
   return (
     <div className="relative z-10 min-h-[100dvh] w-full max-w-full overflow-x-hidden flex flex-col" data-testid="converter-studio">
+      {/* Floating Pop-Up Conversion Alert Toast */}
+      {alertToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="conversion-popup-alert"
+          className={`fixed bottom-5 right-4 z-50 w-[calc(100vw-2rem)] max-w-sm rounded-2xl p-4 backdrop-blur-xl shadow-2xl border transition-all ${
+            alertToast.kind === 'completed'
+              ? 'bg-[#091820]/95 border-emerald-400/55 shadow-[0_12px_40px_-8px_rgba(16,185,129,0.45)]'
+              : alertToast.kind === 'cancelled'
+                ? 'bg-[#0B111C]/95 border-slate-500/45 shadow-[0_12px_32px_-8px_rgba(0,0,0,0.65)]'
+                : 'bg-[#1D0B12]/95 border-rose-400/55 shadow-[0_12px_40px_-8px_rgba(244,63,94,0.4)]'
+          }`}
+        >
+          <div className="flex items-start gap-3">
+            {alertToast.kind === 'completed' ? (
+              <BellRing className="w-5 h-5 text-emerald-300 shrink-0 mt-0.5" aria-hidden="true" />
+            ) : alertToast.kind === 'cancelled' ? (
+              <AlertCircle className="w-5 h-5 text-slate-300 shrink-0 mt-0.5" aria-hidden="true" />
+            ) : (
+              <AlertCircle className="w-5 h-5 text-rose-300 shrink-0 mt-0.5" aria-hidden="true" />
+            )}
+
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold text-white">{alertToast.title}</p>
+              <p className="text-[11px] text-slate-200/90 mt-1 leading-relaxed break-words">
+                {alertToast.body}
+              </p>
+
+              {alertToast.kind === 'completed' && conversionResult && (
+                <div className="mt-2.5 flex items-center gap-2">
+                  <a
+                    href={conversionResult.url}
+                    download={conversionResult.outputFilename}
+                    className="hardware-cta-primary inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold"
+                  >
+                    <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                    <span>Save Output</span>
+                  </a>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      document.querySelector('[data-testid="conversion-result"]')?.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'nearest',
+                      });
+                      setAlertToast(null);
+                    }}
+                    className="hardware-btn px-2.5 py-1.5 rounded-lg text-[11px] font-medium text-cyan-100 hover:text-white cursor-pointer"
+                  >
+                    View File
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setAlertToast(null)}
+              aria-label="Dismiss conversion notification"
+              className="text-slate-400 hover:text-white p-1 rounded-lg cursor-pointer shrink-0"
+            >
+              <X className="w-4 h-4" aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Three-Zone Top Bar */}
       <header className="w-full border-b border-cyan-400/20 bg-[#07090E]/82 backdrop-blur-md">
         <div className="max-w-[1380px] mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-3 sm:gap-8 min-w-0">
@@ -864,7 +1019,7 @@ export function ConverterStudio({
                 )}
               </button>
 
-              {/* Progress Bar, Active 8D Spinning Radar & User-Facing Status Log */}
+              {/* Progress Bar, Cancel Control, Active 8D Spinning Radar & User-Facing Status Log */}
               {(isConverting || phase === 'completed') && (
                 <div className="glass-subpanel rounded-xl p-3.5 flex flex-col gap-2.5">
                   {isConverting && exportFormat === '8d-spatial' && (
@@ -876,10 +1031,25 @@ export function ConverterStudio({
                     />
                   )}
                   <div className="flex items-center justify-between gap-2 text-xs">
-                    <span className="text-cyan-100 font-medium">{PHASE_LABELS[phase]}</span>
-                    <span className="font-mono tabular-nums text-cyan-300 font-semibold">
-                      {progressPct}%
+                    <span className="text-cyan-100 font-medium min-w-0 truncate">
+                      {PHASE_LABELS[phase]}
                     </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="font-mono tabular-nums text-cyan-300 font-semibold">
+                        {progressPct}%
+                      </span>
+                      {isConverting && (
+                        <button
+                          type="button"
+                          onClick={handleCancelConversion}
+                          aria-label="Cancel audio conversion"
+                          data-testid="cancel-conversion-btn"
+                          className="hardware-btn px-2 py-1 rounded-md text-[11px] font-medium text-rose-200 hover:text-white hover:border-rose-400/50 cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      )}
+                    </div>
                   </div>
                   <div className="h-2 w-full rounded-full bg-slate-900 overflow-hidden">
                     <div
@@ -887,6 +1057,15 @@ export function ConverterStudio({
                       style={{ width: `${progressPct}%` }}
                     />
                   </div>
+                  {isConverting && (
+                    <p className="text-[11px] text-cyan-200/75 leading-snug">
+                      {runtimeEnv === 'windows-desktop'
+                        ? 'Background tray execution active — safe to minimize or close to tray while converting.'
+                        : runtimeEnv === 'android-native'
+                          ? 'Background service active — safe to switch apps; a pop-up alert will notify you on completion.'
+                          : 'Off-thread streaming active — a browser alert will notify you when complete.'}
+                    </p>
+                  )}
                   {conversionLogs.length > 0 && (
                     <ul
                       aria-label="Conversion status log"
