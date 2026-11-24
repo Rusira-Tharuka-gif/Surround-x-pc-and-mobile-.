@@ -50,8 +50,10 @@ jobs:
         working-directory: ${{ runner.temp }}/repo
         shell: pwsh
         run: |
-          @'
+          $repairScript = @'
           const { execFileSync } = require('node:child_process');
+          const fs = require('node:fs');
+          const path = require('node:path');
           const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
           function tryLoad(id) {
@@ -63,39 +65,98 @@ jobs:
             }
           }
 
-          function installExact(spec) {
-            console.log('[ci] Installing missing/fallback package:', spec);
-            execFileSync(npmCmd, ['install', '--no-save', '--legacy-peer-deps', '--force', spec], {
-              stdio: 'inherit',
-              shell: true,
-            });
+          function installBatch(specs) {
+            if (!specs.length) return;
+            console.log('[ci] Installing Windows native packages:', specs.join(' '));
+            execFileSync(
+              npmCmd,
+              ['install', '--no-save', '--legacy-peer-deps', '--include=optional', '--force', ...specs],
+              { stdio: 'inherit', shell: true }
+            );
+          }
+
+          function unpackPackageIntoNodeModules(spec, pkgDirName) {
+            const tmpDir = fs.mkdtempSync(path.join(process.cwd(), '.pkg-unpack-'));
+            try {
+              execFileSync(npmCmd, ['pack', spec], { cwd: tmpDir, stdio: 'inherit', shell: true });
+              const tgz = fs.readdirSync(tmpDir).find((f) => f.endsWith('.tgz'));
+              if (!tgz) throw new Error('npm pack produced no tarball for ' + spec);
+              const destDir = path.join(process.cwd(), 'node_modules', ...pkgDirName.split('/'));
+              fs.mkdirSync(destDir, { recursive: true });
+              execFileSync('tar', ['-xzf', path.join(tmpDir, tgz), '--strip-components=1', '-C', destDir], {
+                stdio: 'inherit',
+              });
+            } finally {
+              fs.rmSync(tmpDir, { recursive: true, force: true });
+            }
+          }
+
+          function ensureVcRedistIfNeeded(err) {
+            if (!err || err.code === 'MODULE_NOT_FOUND' || process.platform !== 'win32') return false;
+            console.warn('[ci] Native .node load failed (' + (err.code || err.message) + '); installing VC++ 2015-2022 x64 Redistributable...');
+            execFileSync(
+              'pwsh',
+              [
+                '-NoProfile',
+                '-Command',
+                "$vc = Join-Path $env:RUNNER_TEMP 'vc_redist.x64.exe'; Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vc; $p = Start-Process -FilePath $vc -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru; if ($p.ExitCode -notin 0, 1638, 3010) { throw \"vc_redist exit $($p.ExitCode)\" }",
+              ],
+              { stdio: 'inherit' }
+            );
+            return true;
           }
 
           const rolldownVer = require('./node_modules/rolldown/package.json').version;
-          let err = tryLoad('@rolldown/binding-win32-x64-msvc');
-          if (err) {
-            console.warn('[ci] Native @rolldown/binding-win32-x64-msvc unavailable:', err.message);
-            installExact('@rolldown/binding-win32-x64-msvc@' + rolldownVer);
-            err = tryLoad('@rolldown/binding-win32-x64-msvc');
-          }
-          if (err) {
-            console.warn('[ci] Native rolldown still unavailable; installing WASI fallback:', err.message);
-            installExact('@rolldown/binding-wasm32-wasi@' + rolldownVer);
-          }
-
           const lightningVer = require('./node_modules/lightningcss/package.json').version;
-          if (tryLoad('lightningcss-win32-x64-msvc')) {
-            installExact('lightningcss-win32-x64-msvc@' + lightningVer);
-          }
-
           const oxideVer = require('./node_modules/@tailwindcss/oxide/package.json').version;
-          if (tryLoad('@tailwindcss/oxide-win32-x64-msvc')) {
-            installExact('@tailwindcss/oxide-win32-x64-msvc@' + oxideVer);
-            if (tryLoad('@tailwindcss/oxide-win32-x64-msvc') && tryLoad('@tailwindcss/oxide-wasm32-wasi')) {
-              installExact('@tailwindcss/oxide-wasm32-wasi@' + oxideVer);
+
+          const targets = [
+            { pkg: '@rolldown/binding-win32-x64-msvc', ver: rolldownVer },
+            { pkg: 'lightningcss-win32-x64-msvc', ver: lightningVer },
+            { pkg: '@tailwindcss/oxide-win32-x64-msvc', ver: oxideVer },
+          ];
+
+          const missingSpecs = [];
+          for (const t of targets) {
+            const err = tryLoad(t.pkg);
+            if (err && err.code === 'MODULE_NOT_FOUND') {
+              missingSpecs.push(t.pkg + '@' + t.ver);
             }
           }
-          '@ | node --input-type=commonjs
+          installBatch(missingSpecs);
+
+          for (const t of targets) {
+            const err = tryLoad(t.pkg);
+            if (err && err.code === 'MODULE_NOT_FOUND') {
+              console.warn('[ci] Fallback unpacking ' + t.pkg + '@' + t.ver + ' directly into node_modules');
+              unpackPackageIntoNodeModules(t.pkg + '@' + t.ver, t.pkg);
+            }
+          }
+
+          let rolldownErr = tryLoad('@rolldown/binding-win32-x64-msvc');
+          if (rolldownErr) {
+            console.warn('[ci] @rolldown/binding-win32-x64-msvc load error:', rolldownErr.code || '', rolldownErr.message);
+            if (ensureVcRedistIfNeeded(rolldownErr)) {
+              rolldownErr = tryLoad('@rolldown/binding-win32-x64-msvc');
+            }
+          }
+
+          if (rolldownErr) {
+            console.warn('[ci] Native rolldown unavailable (' + rolldownErr.message + '); installing WASI fallback');
+            const wasiSpec = '@rolldown/binding-wasm32-wasi@' + rolldownVer;
+            installBatch([wasiSpec, '@napi-rs/wasm-runtime@1.2.6', '@emnapi/core@2.0.0-beta.2', '@emnapi/runtime@2.0.0-beta.2']);
+            if (tryLoad('@rolldown/binding-wasm32-wasi')?.code === 'MODULE_NOT_FOUND') {
+              unpackPackageIntoNodeModules(wasiSpec, '@rolldown/binding-wasm32-wasi');
+            }
+            const wasiErr = tryLoad('@rolldown/binding-wasm32-wasi');
+            if (wasiErr) {
+              throw wasiErr;
+            }
+          } else {
+            console.log('[ci] Native @rolldown/binding-win32-x64-msvc loaded OK');
+          }
+          '@
+          $repairScript | node --input-type=commonjs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node -e "Promise.all([import('rolldown/parseAst'), import('@tailwindcss/vite')]).then(() => console.log('[ci] rolldown and tailwindcss bindings OK')).catch((e) => { console.error(e); process.exit(1); })"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
