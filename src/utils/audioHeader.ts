@@ -174,29 +174,39 @@ export function computeChunkWindows(
 
 /**
  * Chooses a frame-aligned chunk duration (multiples of 4s @ 48 kHz = exact multiples of
- * 1,536 AC3 frames and 512 DTS frames). Standard tracks (<= 20 MB up to 30 min) use 60s
- * blocks, larger tracks (<= 80 MB) use 40s blocks, and huge lossless/6ch streams use 20s
- * blocks to stay memory-safe while cutting per-chunk FFmpeg startup/seek overhead dramatically.
+ * 1,536 AC3 frames and 512 DTS frames). Standard & heavy desktop tracks use 60s stereo
+ * blocks (40s for discrete 6ch) so memory stays bounded (~11.5-34.5 MB per chunk) while
+ * cutting FFmpeg WASM invocations and container re-seeks by up to 3x.
  */
 export function computeAdaptiveChunkDurationSec(
   sourceSizeBytes: number,
   durationSec: number,
   isDiscrete6Ch = false,
+  isMobile = false,
 ): number {
   const mb = sourceSizeBytes / (1024 * 1024);
   if (isDiscrete6Ch) {
+    if (!isMobile && mb <= 220 && durationSec <= 1800) {
+      return 40;
+    }
     return durationSec > 0 && durationSec <= 240 && mb <= 32 ? 40 : 20;
   }
-  if (mb <= 20 && durationSec > 0 && durationSec <= 1800) {
+  if (!isMobile) {
+    if (mb <= 220 && (durationSec <= 0 || durationSec <= 1800)) {
+      return 60;
+    }
+    return 40;
+  }
+  if (mb <= 24 && durationSec > 0 && durationSec <= 1800) {
     return 60;
   }
-  if (mb <= 80 && durationSec > 0 && durationSec <= 1800) {
+  if (mb <= 100 && durationSec > 0 && durationSec <= 1800) {
     return 40;
   }
   return 20;
 }
 
-const FAST_INPUT_SEEK_FORMATS = new Set(['wav', 'flac', 'm4a', 'mp4', 'aiff']);
+const FAST_INPUT_SEEK_FORMATS = new Set(['wav', 'flac', 'm4a', 'mp4', 'mov', 'm4v', 'aiff']);
 
 export function isFastInputSeekFormat(ext: string): boolean {
   return FAST_INPUT_SEEK_FORMATS.has(ext.toLowerCase());
@@ -248,13 +258,16 @@ export function buildFfmpegChunkDecodeArgs(options: {
     inputExt = '',
   } = options;
 
-  // Input seeking (-ss before -i) is sample-exact & instant for WAV/FLAC/M4A/MP4/AIFF;
+  // Input seeking (-ss before -i) is sample-exact & instant for WAV/FLAC/M4A/MP4/MOV/AIFF;
   // output seeking guarantees frame-exact continuity for VBR MP3/OGG/AAC without Xing TOCs.
   const useFastInputSeek = isFastInputSeekFormat(inputExt);
 
   if (useFastInputSeek) {
     return [
       '-y',
+      '-nostats',
+      '-loglevel',
+      'error',
       '-ss',
       String(startSec),
       '-t',
@@ -262,6 +275,8 @@ export function buildFfmpegChunkDecodeArgs(options: {
       '-i',
       inputPath,
       '-vn',
+      '-sn',
+      '-dn',
       '-ar',
       String(targetSampleRate),
       '-ac',
@@ -274,6 +289,9 @@ export function buildFfmpegChunkDecodeArgs(options: {
 
   return [
     '-y',
+    '-nostats',
+    '-loglevel',
+    'error',
     '-i',
     inputPath,
     '-ss',
@@ -281,6 +299,8 @@ export function buildFfmpegChunkDecodeArgs(options: {
     '-t',
     String(durationSec),
     '-vn',
+    '-sn',
+    '-dn',
     '-ar',
     String(targetSampleRate),
     '-ac',

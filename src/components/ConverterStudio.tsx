@@ -501,7 +501,7 @@ export function ConverterStudio({
       if (conversionStartedAtRef.current > 0) {
         setConversionElapsedMs(Math.max(0, Math.round(performance.now() - conversionStartedAtRef.current)));
       }
-    }, 450);
+    }, 950);
     return () => window.clearInterval(timer);
   }, [isConverting]);
 
@@ -700,7 +700,7 @@ export function ConverterStudio({
                   ref={fileInputRef}
                   id="audio-file-input"
                   type="file"
-                  accept="audio/*,.mp3,.wav,.flac,.aac,.m4a,.ogg,.opus,.webm,.mp4"
+                  accept="audio/*,.mp3,.wav,.flac,.aac,.m4a,.ogg,.opus,.webm,.mp4,.mov,.mkv,.m4v"
                   onChange={handleFileInputChange}
                   className="hidden"
                   tabIndex={-1}

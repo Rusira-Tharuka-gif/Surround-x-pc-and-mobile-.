@@ -81,26 +81,27 @@ test('buildStereoWavHeaderBytes and buildFfmpegChunkDecodeArgs produce valid out
   assert.equal(mp3Args.indexOf('-ss') > mp3Args.indexOf('-i'), true);
 });
 
-test('computeAdaptiveChunkDurationSec picks fast frame-aligned windows for small files and 20s for large files', () => {
+test('computeAdaptiveChunkDurationSec picks frame-aligned windows maximizing desktop throughput while keeping mobile bounded', () => {
   const smallChunk = computeAdaptiveChunkDurationSec(4 * 1024 * 1024, 180, false);
   assert.equal(smallChunk, 60);
   assert.equal((smallChunk * 48000) % 1536, 0);
   assert.equal((smallChunk * 48000) % 512, 0);
 
-  const mediumChunk = computeAdaptiveChunkDurationSec(25 * 1024 * 1024, 300, false);
-  assert.equal(mediumChunk, 40);
-  assert.equal((mediumChunk * 48000) % 1536, 0);
-  assert.equal((mediumChunk * 48000) % 512, 0);
+  const heavyDesktopChunk = computeAdaptiveChunkDurationSec(120 * 1024 * 1024, 1200, false, false);
+  assert.equal(heavyDesktopChunk, 60);
+  assert.equal((heavyDesktopChunk * 48000) % 1536, 0);
+  assert.equal((heavyDesktopChunk * 48000) % 512, 0);
 
-  const longCompactMp3Chunk = computeAdaptiveChunkDurationSec(18 * 1024 * 1024, 960, false);
-  assert.equal(longCompactMp3Chunk, 60);
+  const ultraDesktopChunk = computeAdaptiveChunkDurationSec(260 * 1024 * 1024, 1200, false, false);
+  assert.equal(ultraDesktopChunk, 40);
 
-  const longHighBitrateMp3Chunk = computeAdaptiveChunkDurationSec(38 * 1024 * 1024, 960, false);
-  assert.equal(longHighBitrateMp3Chunk, 40);
+  const mobileLargeChunk = computeAdaptiveChunkDurationSec(120 * 1024 * 1024, 1200, false, true);
+  assert.equal(mobileLargeChunk, 20);
 
-  const largeChunk = computeAdaptiveChunkDurationSec(120 * 1024 * 1024, 1200, false);
-  assert.equal(largeChunk, 20);
+  const desktop6chChunk = computeAdaptiveChunkDurationSec(90 * 1024 * 1024, 600, true, false);
+  assert.equal(desktop6chChunk, 40);
 
   assert.equal(isFastInputSeekFormat('flac'), true);
+  assert.equal(isFastInputSeekFormat('mov'), true);
   assert.equal(isFastInputSeekFormat('mp3'), false);
 });

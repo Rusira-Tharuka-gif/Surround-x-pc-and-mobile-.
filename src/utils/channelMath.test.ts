@@ -25,8 +25,10 @@ import {
   isSupportedAudioFile,
   isValidAc3Bitstream,
   matrixUpmixStereoToSixChannels,
+  parsePcmWavHeader,
   processStereoTo8dBinaural,
   sanitizeInputExtension,
+  Streaming8DBinaural,
   StreamingMatrixUpmix51,
   wrapAzimuth180,
   wrapAzimuth360,
@@ -89,6 +91,8 @@ test('sanitizeInputExtension, isSupportedAudioFile, and buildOutputAc3Filename h
   assert.equal(sanitizeInputExtension('noext'), 'wav');
   assert.equal(sanitizeInputExtension('video.exe'), 'bin');
   assert.equal(isSupportedAudioFile('song.flac', ''), true);
+  assert.equal(isSupportedAudioFile('concert.mkv', 'video/x-matroska'), true);
+  assert.equal(isSupportedAudioFile('clip.mov', 'video/quicktime'), true);
   assert.equal(isSupportedAudioFile('notes.txt', 'text/plain'), false);
   assert.equal(buildOutputAc3Filename('Hans Zimmer - Interstellar.flac'), 'Hans_Zimmer_-_Interstellar_5.1.ac3');
 });
@@ -525,5 +529,81 @@ test('5.1 AC3 and DTS bounded streaming chunks align to exact codec frame bounda
     }
   }
 });
+
+test('processInterleavedInt16StereoToWavBytes and 8D Int16 streaming match decoded Float32 output bit-for-bit including carry prefixes', () => {
+  const sr = 48000;
+  const wav = createDemoStereoWavBuffer(2, sr);
+  const hdr = parsePcmWavHeader(wav);
+  assert.equal(hdr.isFastLittleEndianInt16Stereo, true);
+  assert.equal(hdr.numFrames, sr * 2);
+
+  const pcm16 = new Int16Array(wav.buffer, wav.byteOffset + hdr.dataOffset, hdr.numFrames * 2);
+  const decoded = decodePcmWavToChannels(wav);
+  const defaultGains = { FL: 1, FR: 1, C: 1, LFE: 1, SL: 1, SR: 1 };
+
+  // Reference Float32 5.1 single-pass
+  const refUpmix = new StreamingMatrixUpmix51(defaultGains, 'cinema-pro', sr);
+  const refSumSq = new Float64Array(6);
+  const refWav = refUpmix.processRangeToWavBytes(
+    decoded.channels[0],
+    decoded.channels[1],
+    0,
+    hdr.numFrames,
+    sr,
+    refSumSq,
+    true,
+  );
+
+  // Fast Int16 streaming 5.1 with a non-aligned 500-frame carry prefix + remaining Int16 frames
+  const fastUpmix = new StreamingMatrixUpmix51(defaultGains, 'cinema-pro', sr);
+  const fastSumSq = new Float64Array(6);
+  const carryCount = 500;
+  const fastWav = fastUpmix.processInterleavedInt16StereoToWavBytes(
+    pcm16,
+    carryCount,
+    hdr.numFrames - carryCount,
+    sr,
+    fastSumSq,
+    true,
+    decoded.channels[0].subarray(0, carryCount),
+    decoded.channels[1].subarray(0, carryCount),
+  );
+
+  assert.equal(fastWav.byteLength, refWav.byteLength);
+  for (let i = 0; i < refWav.byteLength; i++) {
+    assert.equal(fastWav[i], refWav[i], `5.1 byte mismatch at ${i}`);
+  }
+  for (let ch = 0; ch < 6; ch++) {
+    assert.ok(Math.abs(fastSumSq[ch] - refSumSq[ch]) < 1e-9);
+  }
+
+  // Verify 8D Binaural Float32 vs Fast Int16 streaming bit-identity
+  const ref8d = new Streaming8DBinaural({ sampleRate: sr, orbitPeriodSec: 4 });
+  const ref8dWav = ref8d.processRangeToPcm16Bytes(
+    decoded.channels[0],
+    decoded.channels[1],
+    0,
+    hdr.numFrames,
+    true,
+    true,
+  );
+
+  const fast8d = new Streaming8DBinaural({ sampleRate: sr, orbitPeriodSec: 4 });
+  const fast8dWav = fast8d.processInterleavedInt16StereoToPcm16Bytes(
+    pcm16,
+    carryCount,
+    hdr.numFrames - carryCount,
+    true,
+    true,
+    decoded.channels[0].subarray(0, carryCount),
+    decoded.channels[1].subarray(0, carryCount),
+  );
+
+  assert.equal(fast8dWav.byteLength, ref8dWav.byteLength);
+  for (let i = 0; i < ref8dWav.byteLength; i++) {
+    assert.equal(fast8dWav[i], ref8dWav[i], `8D byte mismatch at ${i}`);
+  }
+});
+
 
 

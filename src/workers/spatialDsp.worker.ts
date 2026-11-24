@@ -2,6 +2,7 @@ import type { ChannelId, UpmixProfile } from '../utils/audioTypes';
 import {
   decodePcmWavToChannels,
   encodeDiscreteSixChannelsToWav,
+  parsePcmWavHeader,
   Streaming8DBinaural,
   StreamingMatrixUpmix51,
 } from '../utils/channelMath';
@@ -188,6 +189,107 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
 
     if (type === 'processChunk') {
       const { wavBuffer, applyEndFade, emitRawStereoPcm, isLastChunk = true } = event.data.payload;
+
+      // Zero-large-allocation fast streaming path for FFmpeg's standard little-endian Int16 stereo WAV chunks
+      if (!sessionDiscrete6Ch && wavBuffer.byteLength > 0) {
+        const wavBytes = new Uint8Array(wavBuffer);
+        const hdr = parsePcmWavHeader(wavBytes);
+        if (hdr.isFastLittleEndianInt16Stereo) {
+          const frameAlign = sessionMode === '8d' && !emitRawStereoPcm ? 4608 : 1536;
+          const prevCarryCount =
+            carryLeft && carryRight ? Math.min(carryLeft.length, carryRight.length) : 0;
+          const totalFrames = prevCarryCount + hdr.numFrames;
+          const emitFrames = isLastChunk
+            ? totalFrames
+            : Math.floor(totalFrames / frameAlign) * frameAlign;
+          const pcm16 =
+            hdr.numFrames > 0
+              ? new Int16Array(wavBuffer, wavBytes.byteOffset + hdr.dataOffset, hdr.numFrames * 2)
+              : new Int16Array(0);
+          const inv32768 = 1 / 32768;
+
+          if (emitFrames === 0) {
+            if (hdr.numFrames > 0) {
+              const tailL = new Float32Array(hdr.numFrames);
+              const tailR = new Float32Array(hdr.numFrames);
+              for (let f = 0, idx = 0; f < hdr.numFrames; f++, idx += 2) {
+                tailL[f] = pcm16[idx] * inv32768;
+                tailR[f] = pcm16[idx + 1] * inv32768;
+              }
+              carryLeft = concatFloat32(carryLeft, tailL);
+              carryRight = concatFloat32(carryRight, tailR);
+            }
+            const empty = new Uint8Array(0);
+            workerScope.postMessage({ id, ok: true, result: { outBuffer: empty.buffer, byteLength: 0 } }, [
+              empty.buffer,
+            ]);
+            return;
+          }
+
+          const usedPrevCarryL = prevCarryCount > 0 ? carryLeft : null;
+          const usedPrevCarryR = prevCarryCount > 0 ? carryRight : null;
+          const consumedFromPcm = Math.max(0, emitFrames - prevCarryCount);
+          const remainingPcm = hdr.numFrames - consumedFromPcm;
+
+          if (!isLastChunk && remainingPcm > 0) {
+            const nextCarryL = new Float32Array(remainingPcm);
+            const nextCarryR = new Float32Array(remainingPcm);
+            for (let f = 0, idx = consumedFromPcm * 2; f < remainingPcm; f++, idx += 2) {
+              nextCarryL[f] = pcm16[idx] * inv32768;
+              nextCarryR[f] = pcm16[idx + 1] * inv32768;
+            }
+            carryLeft = nextCarryL;
+            carryRight = nextCarryR;
+          } else {
+            carryLeft = null;
+            carryRight = null;
+          }
+
+          totalProcessedFrames += emitFrames;
+
+          if (sessionMode === '8d') {
+            if (!session8d) {
+              throw new Error('8D binaural processor not initialized in DSP worker.');
+            }
+            const outBytes = session8d.processInterleavedInt16StereoToPcm16Bytes(
+              pcm16,
+              0,
+              consumedFromPcm,
+              !emitRawStereoPcm,
+              applyEndFade,
+              usedPrevCarryL,
+              usedPrevCarryR,
+            );
+            const outBuf = outBytes.buffer as ArrayBuffer;
+            workerScope.postMessage(
+              { id, ok: true, result: { outBuffer: outBuf, byteLength: outBytes.byteLength } },
+              [outBuf],
+            );
+            return;
+          }
+
+          if (!sessionUpmix) {
+            throw new Error('5.1 matrix processor not initialized in DSP worker.');
+          }
+          const wavOut = sessionUpmix.processInterleavedInt16StereoToWavBytes(
+            pcm16,
+            0,
+            consumedFromPcm,
+            sessionSampleRate,
+            sumSq,
+            applyEndFade,
+            usedPrevCarryL,
+            usedPrevCarryR,
+          );
+          const outBuf = wavOut.buffer as ArrayBuffer;
+          workerScope.postMessage(
+            { id, ok: true, result: { outBuffer: outBuf, byteLength: wavOut.byteLength } },
+            [outBuf],
+          );
+          return;
+        }
+      }
+
       const decoded =
         wavBuffer.byteLength === 0
           ? { sampleRate: sessionSampleRate, channels: [] as Float32Array[] }

@@ -34,7 +34,8 @@ let conversionInFlight = false;
 const TARGET_SAMPLE_RATE = 48000;
 const CHUNK_DURATION_SEC = 20;
 const MAX_DURATION_SEC = 1800; // 30 minutes via streaming chunks
-const MEMFS_FAST_WRITE_MAX_BYTES = 64 * 1024 * 1024;
+const MEMFS_FAST_WRITE_MAX_BYTES_DESKTOP = 128 * 1024 * 1024;
+const MEMFS_FAST_WRITE_MAX_BYTES_MOBILE = 64 * 1024 * 1024;
 
 function isLikelyMobileDevice(): boolean {
   if (typeof navigator === 'undefined') return false;
@@ -500,9 +501,8 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
   let chunkSegOut = '';
 
   const ffmpegLogListener = ({ message }: { message: string }) => {
+    if (recentLogs.length >= 48) recentLogs.shift();
     recentLogs.push(message);
-    if (recentLogs.length > 60) recentLogs.shift();
-    console.debug('[Surround X][FFmpeg]', message);
   };
 
   const attachFfmpegListeners = (instance: FFmpeg) => {
@@ -535,8 +535,8 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     const is8dMode = exportFormat === '8d-spatial';
     const is8dWavDirect = is8dMode && spatialContainer === 'wav';
     const mobileDevice = isLikelyMobileDevice();
-    const fastWebAudioMaxBytes = mobileDevice ? 24 * 1024 * 1024 : 48 * 1024 * 1024;
-    const fastWebAudioMaxDurationSec = mobileDevice ? 600 : 1080;
+    const fastWebAudioMaxBytes = mobileDevice ? 24 * 1024 * 1024 : 64 * 1024 * 1024;
+    const fastWebAudioMaxDurationSec = mobileDevice ? 600 : 960;
 
     const fileToMount =
       sourceFile instanceof File
@@ -549,9 +549,14 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     runId = Date.now().toString(36);
 
     const alwaysNativeBitstream = ext === 'ac3' || ext === 'dts';
+    const skipWebAudioForHeavyContainer =
+      (ext === 'wav' && fileToMount.size > 24 * 1024 * 1024) ||
+      ((ext === 'mp4' || ext === 'mov' || ext === 'mkv' || ext === 'webm' || ext === 'm4v') &&
+        fileToMount.size > 32 * 1024 * 1024);
     const canTryFastDecode =
       fileToMount.size > 0 &&
       fileToMount.size <= fastWebAudioMaxBytes &&
+      !skipWebAudioForHeavyContainer &&
       (durationSec <= 0 || durationSec <= fastWebAudioMaxDurationSec) &&
       (is8dMode || (sourceChannels < 6 && !alwaysNativeBitstream));
 
@@ -623,6 +628,9 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
         const encExit = await ffmpeg.exec(
           [
             '-y',
+            '-nostats',
+            '-loglevel',
+            'error',
             '-i',
             chunkSegIn,
             '-vn',
@@ -665,7 +673,12 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
       if (exportFormat === 'flac') {
         await ffmpeg.writeFile(chunkSegIn, processedBytes, { signal });
         const flacSegName = `flac_${runId}_${blockIndex}.flac`;
-        const encArgs = buildFfmpegArgsForFormat(chunkSegIn, flacSegName, 'flac', { bitrateKbps });
+        const encArgs = [
+          '-nostats',
+          '-loglevel',
+          'error',
+          ...buildFfmpegArgsForFormat(chunkSegIn, flacSegName, 'flac', { bitrateKbps }),
+        ];
         const encExit = await ffmpeg.exec(encArgs, -1, { signal });
         await ffmpeg.deleteFile(chunkSegIn).catch(() => undefined);
 
@@ -679,9 +692,14 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
 
       // 5.1 AC3 / DTS bounded chunk encoding
       await ffmpeg.writeFile(chunkSegIn, processedBytes, { signal });
-      const encArgs = buildFfmpegArgsForFormat(chunkSegIn, chunkSegOut, exportFormat, {
-        bitrateKbps,
-      });
+      const encArgs = [
+        '-nostats',
+        '-loglevel',
+        'error',
+        ...buildFfmpegArgsForFormat(chunkSegIn, chunkSegOut, exportFormat, {
+          bitrateKbps,
+        }),
+      ];
       const encExit = await ffmpeg.exec(encArgs, -1, { signal });
       await ffmpeg.deleteFile(chunkSegIn).catch(() => undefined);
 
@@ -716,6 +734,7 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
         fileToMount.size,
         resolvedDurationSec,
         false,
+        mobileDevice,
       );
       const chunkFrames = Math.max(4096, Math.round(chunkDurationSec * TARGET_SAMPLE_RATE));
       const totalChunks = Math.max(1, Math.ceil(totalFrames / chunkFrames));
@@ -808,7 +827,10 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
       const safeMountFileName = `src_${runId}.${ext}`;
       let mountedViaWorkerFs = false;
 
-      if (fileToMount.size <= MEMFS_FAST_WRITE_MAX_BYTES) {
+      const memfsFastLimit = mobileDevice
+        ? MEMFS_FAST_WRITE_MAX_BYTES_MOBILE
+        : MEMFS_FAST_WRITE_MAX_BYTES_DESKTOP;
+      if (fileToMount.size <= memfsFastLimit) {
         try {
           fallbackRawName = `raw_${runId}.${ext}`;
           const memBytes = sourceBytes
@@ -880,6 +902,7 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
         fileToMount.size,
         effectiveDurationSec,
         isDiscrete6Ch,
+        mobileDevice,
       );
       const windows = computeChunkWindows(
         effectiveDurationSec,
@@ -908,7 +931,8 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
 
       if (useLinearSegmentedPass) {
         // O(N) linear single-pass demux/decode into compact segments (eliminates O(N^2) output seeking)
-        const useFlacSegments = effectiveDurationSec > 480 || isDiscrete6Ch;
+        const useFlacSegments =
+          isDiscrete6Ch || (mobileDevice ? effectiveDurationSec > 480 : effectiveDurationSec > 900);
         const segExt = useFlacSegments ? 'flac' : 'wav';
         const segPrefix = `segdec_${runId}_`;
         const segPattern = `${segPrefix}%03d.${segExt}`;
@@ -942,6 +966,8 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
             '-i',
             inputPath,
             '-vn',
+            '-sn',
+            '-dn',
             '-t',
             String(Math.ceil(effectiveDurationSec) + 2),
             '-ar',
@@ -1016,6 +1042,9 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
             const decExit = await ffmpeg.exec(
               [
                 '-y',
+                '-nostats',
+                '-loglevel',
+                'error',
                 '-i',
                 segName,
                 '-ar',
@@ -1232,6 +1261,9 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
         const concatExit = await ffmpeg.exec(
           [
             '-y',
+            '-nostats',
+            '-loglevel',
+            'error',
             '-f',
             'concat',
             '-safe',
@@ -1241,7 +1273,7 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
             '-c:a',
             'flac',
             '-compression_level',
-            '2',
+            '1',
             '-ar',
             String(TARGET_SAMPLE_RATE),
             '-ac',

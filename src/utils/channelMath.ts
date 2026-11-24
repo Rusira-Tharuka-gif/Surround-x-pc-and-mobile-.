@@ -67,6 +67,9 @@ export function sanitizeInputExtension(filename: string): string {
     'opus',
     'webm',
     'mp4',
+    'mov',
+    'mkv',
+    'm4v',
     'aiff',
     'wma',
     'ac3',
@@ -75,7 +78,15 @@ export function sanitizeInputExtension(filename: string): string {
 }
 
 export function isSupportedAudioFile(filename: string, mimeType: string): boolean {
-  if (mimeType && (mimeType.startsWith('audio/') || mimeType === 'video/mp4' || mimeType === 'video/webm')) {
+  if (
+    mimeType &&
+    (mimeType.startsWith('audio/') ||
+      mimeType === 'video/mp4' ||
+      mimeType === 'video/webm' ||
+      mimeType === 'video/quicktime' ||
+      mimeType === 'video/x-matroska' ||
+      mimeType === 'video/x-m4v')
+  ) {
     return true;
   }
   const ext = sanitizeInputExtension(filename);
@@ -174,7 +185,7 @@ export function buildFfmpegArgsForFormat(
         '-c:a',
         'flac',
         '-compression_level',
-        '2',
+        '1',
         '-ar',
         '48000',
         '-ac',
@@ -468,17 +479,21 @@ export function encodeStereoPcmWav(
   return new Uint8Array(buffer);
 }
 
-/**
- * Decodes an uncompressed PCM16 / PCM24 / Float32 RIFF WAVE buffer into Float32Array channels
- * by walking RIFF chunks safely (handles LIST/INFO/JUNK chunks written by FFmpeg).
- */
-export function decodePcmWavToChannels(
+export interface ParsedWavHeaderInfo {
+  sampleRate: number;
+  numChannels: number;
+  bitsPerSample: number;
+  audioFormat: number;
+  dataOffset: number;
+  dataLength: number;
+  numFrames: number;
+  isFastLittleEndianInt16Stereo: boolean;
+}
+
+export function parsePcmWavHeader(
   wavBytes: Uint8Array,
   maxFrames = 600 * 48000,
-): {
-  sampleRate: number;
-  channels: Float32Array[];
-} {
+): ParsedWavHeaderInfo {
   if (wavBytes.byteLength < 44) {
     throw new Error('WAV buffer is too short to be valid.');
   }
@@ -528,16 +543,59 @@ export function decodePcmWavToChannels(
   if (dataOffset < 0 || numChannels <= 0) {
     throw new Error('WAV data chunk missing or empty.');
   }
-  if (dataLength === 0) {
+
+  const bytesPerSample = Math.max(1, bitsPerSample / 8);
+  const blockAlign = numChannels * bytesPerSample;
+  const numFrames = dataLength === 0 ? 0 : Math.min(maxFrames, Math.floor(dataLength / blockAlign));
+  const isFastLittleEndianInt16Stereo =
+    IS_LITTLE_ENDIAN &&
+    audioFormat === 1 &&
+    bitsPerSample === 16 &&
+    numChannels === 2 &&
+    ((wavBytes.byteOffset + dataOffset) & 1) === 0;
+
+  return {
+    sampleRate,
+    numChannels,
+    bitsPerSample,
+    audioFormat,
+    dataOffset,
+    dataLength,
+    numFrames,
+    isFastLittleEndianInt16Stereo,
+  };
+}
+
+/**
+ * Decodes an uncompressed PCM16 / PCM24 / Float32 RIFF WAVE buffer into Float32Array channels
+ * by walking RIFF chunks safely (handles LIST/INFO/JUNK chunks written by FFmpeg).
+ */
+export function decodePcmWavToChannels(
+  wavBytes: Uint8Array,
+  maxFrames = 600 * 48000,
+): {
+  sampleRate: number;
+  channels: Float32Array[];
+} {
+  const {
+    sampleRate,
+    numChannels,
+    bitsPerSample,
+    audioFormat,
+    dataOffset,
+    dataLength,
+    numFrames,
+  } = parsePcmWavHeader(wavBytes, maxFrames);
+
+  if (dataLength === 0 || numFrames === 0) {
     return {
       sampleRate,
       channels: Array.from({ length: numChannels }, () => new Float32Array(0)),
     };
   }
 
+  const view = new DataView(wavBytes.buffer, wavBytes.byteOffset, wavBytes.byteLength);
   const bytesPerSample = Math.max(1, bitsPerSample / 8);
-  const blockAlign = numChannels * bytesPerSample;
-  const numFrames = Math.min(maxFrames, Math.floor(dataLength / blockAlign));
   const channels = Array.from({ length: numChannels }, () => new Float32Array(numFrames));
 
   if (
@@ -930,6 +988,8 @@ export class StreamingMatrixUpmix51 {
   private readonly bufRVocal = new Float64Array(BLOCK_FRAMES);
   private readonly bufRAir = new Float64Array(BLOCK_FRAMES);
   private readonly bufLfe = new Float64Array(BLOCK_FRAMES);
+  private readonly scratchInL = new Float32Array(BLOCK_FRAMES);
+  private readonly scratchInR = new Float32Array(BLOCK_FRAMES);
 
   private readonly alphaSurHp: number;
   private slHpPrevX = 0;
@@ -1688,6 +1748,94 @@ export class StreamingMatrixUpmix51 {
 
     return new Uint8Array(buffer);
   }
+
+  /**
+   * Streams interleaved Int16 stereo PCM directly in 4096-frame L1 scratch blocks into a 6-channel
+   * WAVEFORMATEXTENSIBLE WAV without allocating huge intermediate Float32Array(N) buffers.
+   */
+  processInterleavedInt16StereoToWavBytes(
+    pcm16In: Int16Array,
+    startFrame: number,
+    pcmFrameCount: number,
+    sampleRate: number,
+    sumSq: Float64Array,
+    applyEndFade: boolean,
+    carryLeft?: Float32Array | null,
+    carryRight?: Float32Array | null,
+  ): Uint8Array {
+    const carryCount =
+      carryLeft && carryRight ? Math.min(carryLeft.length, carryRight.length) : 0;
+    const totalFrames = carryCount + pcmFrameCount;
+    const headerSize = 68;
+    const dataSize = totalFrames * 12;
+    const buffer = new ArrayBuffer(headerSize + dataSize);
+    const view = new DataView(buffer);
+    const offset = writeSixChannelWavHeader(view, totalFrames, sampleRate);
+    const outPcm16 = IS_LITTLE_ENDIAN
+      ? new Int16Array(buffer, headerSize, totalFrames * 6)
+      : null;
+
+    const fadeLen = applyEndFade ? Math.min(totalFrames, 1024) : 0;
+    const fadeStart = totalFrames - fadeLen;
+    let outFramePos = 0;
+
+    if (carryCount > 0 && carryLeft && carryRight) {
+      for (let f = 0; f < carryCount; f += BLOCK_FRAMES) {
+        const count = Math.min(BLOCK_FRAMES, carryCount - f);
+        this.filterSubBlock(carryLeft, carryRight, f, count);
+        this.mixSubBlockWav(
+          carryLeft,
+          carryRight,
+          f,
+          count,
+          outPcm16,
+          outFramePos * 6,
+          outPcm16 ? null : view,
+          offset + outFramePos * 12,
+          sumSq,
+          totalFrames,
+          outFramePos,
+          fadeStart,
+          fadeLen,
+          applyEndFade,
+        );
+        outFramePos += count;
+      }
+    }
+
+    const scL = this.scratchInL;
+    const scR = this.scratchInR;
+    const inv32768 = 1 / 32768;
+
+    for (let f = 0; f < pcmFrameCount; f += BLOCK_FRAMES) {
+      const count = Math.min(BLOCK_FRAMES, pcmFrameCount - f);
+      let idx = (startFrame + f) * 2;
+      for (let k = 0; k < count; k++, idx += 2) {
+        scL[k] = pcm16In[idx] * inv32768;
+        scR[k] = pcm16In[idx + 1] * inv32768;
+      }
+      this.filterSubBlock(scL, scR, 0, count);
+      this.mixSubBlockWav(
+        scL,
+        scR,
+        0,
+        count,
+        outPcm16,
+        outFramePos * 6,
+        outPcm16 ? null : view,
+        offset + outFramePos * 12,
+        sumSq,
+        totalFrames,
+        outFramePos,
+        fadeStart,
+        fadeLen,
+        applyEndFade,
+      );
+      outFramePos += count;
+    }
+
+    return new Uint8Array(buffer);
+  }
 }
 
 export function matrixUpmixStereoToSixChannels(
@@ -2078,6 +2226,25 @@ export function wrapAzimuth360(deg: number): number {
   return ((deg % 360) + 360) % 360;
 }
 
+const ORBIT_LUT_N = 4096;
+const ORBIT_PAN_LUT = new Float64Array(ORBIT_LUT_N + 2);
+const ORBIT_DEPTH_LUT = new Float64Array(ORBIT_LUT_N + 2);
+const ORBIT_GAINL_LUT = new Float64Array(ORBIT_LUT_N + 2);
+const ORBIT_GAINR_LUT = new Float64Array(ORBIT_LUT_N + 2);
+(() => {
+  for (let i = 0; i < ORBIT_LUT_N + 2; i++) {
+    const p = (i % ORBIT_LUT_N) / ORBIT_LUT_N;
+    const rad = -2 * Math.PI * p;
+    const pan = Math.sin(rad);
+    const depth = Math.cos(rad);
+    const panHalf = (pan + 1) * 0.25 * Math.PI;
+    ORBIT_PAN_LUT[i] = pan;
+    ORBIT_DEPTH_LUT[i] = depth;
+    ORBIT_GAINL_LUT[i] = Math.cos(panHalf);
+    ORBIT_GAINR_LUT[i] = Math.sin(panHalf);
+  }
+})();
+
 /**
  * True 360-degree 8D Binaural Spatial Audio DSP processor for headphones.
  * Combines:
@@ -2118,8 +2285,6 @@ export class Streaming8DBinaural {
   private readonly invOrbitSamples: number;
   private readonly verbLen: number;
   private sampleIndex = 0;
-  private outL = 0;
-  private outR = 0;
 
   private ctrlCountdown8d = 0;
   private cachedGainL = 0.7071;
@@ -2130,6 +2295,9 @@ export class Streaming8DBinaural {
   private cachedAlphaL = 0.5;
   private cachedAlphaR = 0.5;
   private cachedCenterWeight = 0.28;
+
+  private readonly scratchInL = new Float32Array(BLOCK_FRAMES);
+  private readonly scratchInR = new Float32Array(BLOCK_FRAMES);
 
   constructor(options: Binaural8DOptions = {}) {
     this.sampleRate = options.sampleRate ?? 48000;
@@ -2155,101 +2323,207 @@ export class Streaming8DBinaural {
     this.invOrbitSamples = 1 / (this.sampleRate * this.orbitPeriodSec);
   }
 
-  private readItd(buf: Float32Array, d: number): number {
-    const intD = d | 0;
-    let idx0 = this.itdWrite - intD;
-    if (idx0 < 0) idx0 += this.itdBufLen;
-    let idx1 = idx0 - 1;
-    if (idx1 < 0) idx1 += this.itdBufLen;
-    const frac = d - intD;
-    return buf[idx0] * (1 - frac) + buf[idx1] * frac;
-  }
+  private runBlock(
+    leftIn: Float32Array,
+    rightIn: Float32Array,
+    sOff: number,
+    count: number,
+    outFloatL: Float32Array | null,
+    outFloatR: Float32Array | null,
+    floatOutStart: number,
+    pcm16: Int16Array | null,
+    pcmStartIdx: number,
+    fallbackView: DataView | null,
+    fallbackByteOffset: number,
+    totalEmitFrames: number,
+    emitFrameBase: number,
+    fadeStart: number,
+    fadeLen: number,
+    applyEndFade: boolean,
+  ): void {
+    const itdBufL = this.itdBufL;
+    const itdBufR = this.itdBufR;
+    const itdLen = this.itdBufLen;
+    let itdWrite = this.itdWrite;
 
-  private processSample(l: number, r: number): void {
-    const mono = (l + r) * 0.5;
-    const widthSide = (l - r) * 0.25;
-
-    this.subBassState = this.subBassState + this.subAlpha * (mono - this.subBassState);
-    const orbitMid = mono - this.subBassState * 0.45;
-    const srcL = orbitMid + widthSide;
-    const srcR = orbitMid - widthSide;
-
-    this.itdBufL[this.itdWrite] = srcL;
-    this.itdBufR[this.itdWrite] = srcR;
-
-    if (this.ctrlCountdown8d === 0) {
-      this.ctrlCountdown8d = 7;
-      const progress = this.sampleIndex * this.invOrbitSamples;
-      const azimuthDeg = get8dAzimuthDegrees(progress);
-      const azimuthRad = (azimuthDeg * Math.PI) / 180;
-      const pan = Math.sin(azimuthRad);
-      const depth = Math.cos(azimuthRad);
-
-      const panHalfAngle = (pan + 1) * 0.25 * Math.PI;
-      this.cachedGainL = Math.cos(panHalfAngle);
-      this.cachedGainR = Math.sin(panHalfAngle);
-
-      const rearDepthNorm = (depth + 1) * 0.5;
-      this.cachedPresence = 0.82 + 0.18 * rearDepthNorm;
-
-      this.cachedDelayL = pan > 0 ? pan * this.maxItdSamples : 0;
-      this.cachedDelayR = pan < 0 ? -pan * this.maxItdSamples : 0;
-
-      const rearCutoff = 3800 + 11700 * rearDepthNorm;
-      const cutoffL = Math.max(2400, rearCutoff - (pan > 0 ? pan * 1800 : 0));
-      const cutoffR = Math.max(2400, rearCutoff - (pan < 0 ? -pan * 1800 : 0));
-
-      const wcL = this.twoPiDt * cutoffL;
-      const wcR = this.twoPiDt * cutoffR;
-      this.cachedAlphaL = wcL / (1 + wcL);
-      this.cachedAlphaR = wcR / (1 + wcR);
-      this.cachedCenterWeight = depth > 0 ? depth * 0.28 : 0;
-    } else {
-      this.ctrlCountdown8d--;
-    }
-    this.sampleIndex++;
-
-    const delayedL = this.readItd(this.itdBufL, this.cachedDelayL);
-    const delayedR = this.readItd(this.itdBufR, this.cachedDelayR);
-    if (++this.itdWrite >= this.itdBufLen) this.itdWrite = 0;
-
-    const pres = this.cachedPresence;
-    this.pinnaStateL =
-      this.pinnaStateL + this.cachedAlphaL * (delayedL * this.cachedGainL * pres - this.pinnaStateL);
-    this.pinnaStateR =
-      this.pinnaStateR + this.cachedAlphaR * (delayedR * this.cachedGainR * pres - this.pinnaStateR);
-
+    const verbBufL = this.verbBufL;
+    const verbBufR = this.verbBufR;
     const vLen = this.verbLen;
-    const vIdx = this.verbIdx;
-    let idx1 = vIdx - this.tap1Len;
-    if (idx1 < 0) idx1 += vLen;
-    let idx2 = vIdx - this.tap2Len;
-    if (idx2 < 0) idx2 += vLen;
-    let idx3 = vIdx - this.tap3Len;
-    if (idx3 < 0) idx3 += vLen;
+    const tap1Len = this.tap1Len;
+    const tap2Len = this.tap2Len;
+    const tap3Len = this.tap3Len;
+    let vIdx = this.verbIdx;
 
-    const reflL = this.verbBufL[idx1] * 0.45 + this.verbBufR[idx2] * 0.32 + this.verbBufL[idx3] * 0.23;
-    const reflR = this.verbBufR[idx1] * 0.45 + this.verbBufL[idx2] * 0.32 + this.verbBufR[idx3] * 0.23;
+    let pinnaStateL = this.pinnaStateL;
+    let pinnaStateR = this.pinnaStateR;
+    let reverbDampL = this.reverbDampL;
+    let reverbDampR = this.reverbDampR;
+    let subBassState = this.subBassState;
 
-    this.reverbDampL = this.reverbDampL * 0.68 + reflL * 0.32;
-    this.reverbDampR = this.reverbDampR * 0.68 + reflR * 0.32;
+    const subAlpha = this.subAlpha;
+    const twoPiDt = this.twoPiDt;
+    const maxItdSamples = this.maxItdSamples;
+    const invOrbitSamples = this.invOrbitSamples;
+    const reverbMix = this.reverbMix;
+    const bassAnchor = this.bassAnchor;
 
-    this.verbBufL[vIdx] = Math.max(-1, Math.min(1, this.pinnaStateL * 0.55 + this.reverbDampR * 0.34));
-    this.verbBufR[vIdx] = Math.max(-1, Math.min(1, this.pinnaStateR * 0.55 + this.reverbDampL * 0.34));
-    this.verbIdx = vIdx + 1 >= vLen ? 0 : vIdx + 1;
+    let sampleIndex = this.sampleIndex;
+    let ctrlCountdown8d = this.ctrlCountdown8d;
+    let cachedGainL = this.cachedGainL;
+    let cachedGainR = this.cachedGainR;
+    let cachedPresence = this.cachedPresence;
+    let cachedDelayL = this.cachedDelayL;
+    let cachedDelayR = this.cachedDelayR;
+    let cachedAlphaL = this.cachedAlphaL;
+    let cachedAlphaR = this.cachedAlphaR;
+    let cachedCenterWeight = this.cachedCenterWeight;
 
-    const centerBlend = mono * this.cachedCenterWeight;
+    const panLut = ORBIT_PAN_LUT;
+    const depthLut = ORBIT_DEPTH_LUT;
+    const gainLLut = ORBIT_GAINL_LUT;
+    const gainRLut = ORBIT_GAINR_LUT;
 
-    this.outL =
-      this.pinnaStateL * 1.12 +
-      this.reverbDampL * this.reverbMix +
-      this.subBassState * this.bassAnchor +
-      centerBlend;
-    this.outR =
-      this.pinnaStateR * 1.12 +
-      this.reverbDampR * this.reverbMix +
-      this.subBassState * this.bassAnchor +
-      centerBlend;
+    let pcmIdx = pcmStartIdx;
+    let byteOff = fallbackByteOffset;
+
+    for (let k = 0; k < count; k++) {
+      const l = leftIn[sOff + k];
+      const r = rightIn[sOff + k];
+      const mono = (l + r) * 0.5;
+      const widthSide = (l - r) * 0.25;
+
+      subBassState = subBassState + subAlpha * (mono - subBassState);
+      const orbitMid = mono - subBassState * 0.45;
+      itdBufL[itdWrite] = orbitMid + widthSide;
+      itdBufR[itdWrite] = orbitMid - widthSide;
+
+      if (ctrlCountdown8d === 0) {
+        ctrlCountdown8d = 7;
+        const progress = sampleIndex * invOrbitSamples;
+        const pWrap = progress - Math.floor(progress);
+        const lutPos = pWrap * ORBIT_LUT_N;
+        const lutIdx = lutPos | 0;
+        const lutFrac = lutPos - lutIdx;
+
+        const p0 = panLut[lutIdx];
+        const pan = p0 + (panLut[lutIdx + 1] - p0) * lutFrac;
+        const d0 = depthLut[lutIdx];
+        const depth = d0 + (depthLut[lutIdx + 1] - d0) * lutFrac;
+        const gL0 = gainLLut[lutIdx];
+        cachedGainL = gL0 + (gainLLut[lutIdx + 1] - gL0) * lutFrac;
+        const gR0 = gainRLut[lutIdx];
+        cachedGainR = gR0 + (gainRLut[lutIdx + 1] - gR0) * lutFrac;
+
+        const rearDepthNorm = (depth + 1) * 0.5;
+        cachedPresence = 0.82 + 0.18 * rearDepthNorm;
+        cachedDelayL = pan > 0 ? pan * maxItdSamples : 0;
+        cachedDelayR = pan < 0 ? -pan * maxItdSamples : 0;
+
+        const rearCutoff = 3800 + 11700 * rearDepthNorm;
+        const cutoffL = rearCutoff - (pan > 0 ? pan * 1800 : 0);
+        const cutoffR = rearCutoff - (pan < 0 ? -pan * 1800 : 0);
+        const wcL = twoPiDt * (cutoffL > 2400 ? cutoffL : 2400);
+        const wcR = twoPiDt * (cutoffR > 2400 ? cutoffR : 2400);
+        cachedAlphaL = wcL / (1 + wcL);
+        cachedAlphaR = wcR / (1 + wcR);
+        cachedCenterWeight = depth > 0 ? depth * 0.28 : 0;
+      } else {
+        ctrlCountdown8d--;
+      }
+      sampleIndex++;
+
+      // Read fractional ITD left
+      const intDL = cachedDelayL | 0;
+      let i0L = itdWrite - intDL;
+      if (i0L < 0) i0L += itdLen;
+      let i1L = i0L - 1;
+      if (i1L < 0) i1L += itdLen;
+      const fracL = cachedDelayL - intDL;
+      const delayedL = itdBufL[i0L] * (1 - fracL) + itdBufL[i1L] * fracL;
+
+      // Read fractional ITD right
+      const intDR = cachedDelayR | 0;
+      let i0R = itdWrite - intDR;
+      if (i0R < 0) i0R += itdLen;
+      let i1R = i0R - 1;
+      if (i1R < 0) i1R += itdLen;
+      const fracR = cachedDelayR - intDR;
+      const delayedR = itdBufR[i0R] * (1 - fracR) + itdBufR[i1R] * fracR;
+
+      if (++itdWrite >= itdLen) itdWrite = 0;
+
+      pinnaStateL = pinnaStateL + cachedAlphaL * (delayedL * cachedGainL * cachedPresence - pinnaStateL);
+      pinnaStateR = pinnaStateR + cachedAlphaR * (delayedR * cachedGainR * cachedPresence - pinnaStateR);
+
+      let idx1 = vIdx - tap1Len;
+      if (idx1 < 0) idx1 += vLen;
+      let idx2 = vIdx - tap2Len;
+      if (idx2 < 0) idx2 += vLen;
+      let idx3 = vIdx - tap3Len;
+      if (idx3 < 0) idx3 += vLen;
+
+      const reflL = verbBufL[idx1] * 0.45 + verbBufR[idx2] * 0.32 + verbBufL[idx3] * 0.23;
+      const reflR = verbBufR[idx1] * 0.45 + verbBufL[idx2] * 0.32 + verbBufR[idx3] * 0.23;
+
+      reverbDampL = reverbDampL * 0.68 + reflL * 0.32;
+      reverbDampR = reverbDampR * 0.68 + reflR * 0.32;
+
+      const fbL = pinnaStateL * 0.55 + reverbDampR * 0.34;
+      const fbR = pinnaStateR * 0.55 + reverbDampL * 0.34;
+      verbBufL[vIdx] = fbL > 1 ? 1 : fbL < -1 ? -1 : fbL;
+      verbBufR[vIdx] = fbR > 1 ? 1 : fbR < -1 ? -1 : fbR;
+      if (++vIdx >= vLen) vIdx = 0;
+
+      const centerBlend = mono * cachedCenterWeight;
+      const rawOutL = pinnaStateL * 1.12 + reverbDampL * reverbMix + subBassState * bassAnchor + centerBlend;
+      const rawOutR = pinnaStateR * 1.12 + reverbDampR * reverbMix + subBassState * bassAnchor + centerBlend;
+
+      if (outFloatL && outFloatR) {
+        outFloatL[floatOutStart + k] =
+          rawOutL > -0.9 && rawOutL < 0.9 ? rawOutL : Math.tanh(rawOutL);
+        outFloatR[floatOutStart + k] =
+          rawOutR > -0.9 && rawOutR < 0.9 ? rawOutR : Math.tanh(rawOutR);
+      } else {
+        let fade = 1.0;
+        const fGlobal = emitFrameBase + k;
+        if (applyEndFade && fGlobal >= fadeStart) {
+          const p = (totalEmitFrames - 1 - fGlobal) / fadeLen;
+          fade = p <= 0 ? 0 : p >= 1 ? 1 : p;
+        }
+        const lOut =
+          (rawOutL > -0.88 && rawOutL < 0.88 ? rawOutL : Math.tanh(rawOutL / 0.95) * 0.95) * fade;
+        const rOut =
+          (rawOutR > -0.88 && rawOutR < 0.88 ? rawOutR : Math.tanh(rawOutR / 0.95) * 0.95) * fade;
+
+        if (pcm16) {
+          pcm16[pcmIdx] = lOut <= -1 ? -32767 : lOut >= 1 ? 32767 : Math.round(lOut * 32767);
+          pcm16[pcmIdx + 1] = rOut <= -1 ? -32767 : rOut >= 1 ? 32767 : Math.round(rOut * 32767);
+          pcmIdx += 2;
+        } else if (fallbackView) {
+          fallbackView.setInt16(byteOff, floatToPcm16(lOut), true);
+          fallbackView.setInt16(byteOff + 2, floatToPcm16(rOut), true);
+          byteOff += 4;
+        }
+      }
+    }
+
+    this.itdWrite = itdWrite;
+    this.verbIdx = vIdx;
+    this.pinnaStateL = pinnaStateL;
+    this.pinnaStateR = pinnaStateR;
+    this.reverbDampL = reverbDampL;
+    this.reverbDampR = reverbDampR;
+    this.subBassState = subBassState;
+    this.sampleIndex = sampleIndex;
+    this.ctrlCountdown8d = ctrlCountdown8d;
+    this.cachedGainL = cachedGainL;
+    this.cachedGainR = cachedGainR;
+    this.cachedPresence = cachedPresence;
+    this.cachedDelayL = cachedDelayL;
+    this.cachedDelayR = cachedDelayR;
+    this.cachedAlphaL = cachedAlphaL;
+    this.cachedAlphaR = cachedAlphaR;
+    this.cachedCenterWeight = cachedCenterWeight;
   }
 
   processRangeToFloatArrays(
@@ -2260,11 +2534,9 @@ export class Streaming8DBinaural {
     outL: Float32Array,
     outR: Float32Array,
   ): void {
-    for (let i = start; i < end; i++) {
-      this.processSample(leftIn[i], rightIn[i]);
-      outL[i] = softLimit(this.outL);
-      outR[i] = softLimit(this.outR);
-    }
+    const count = Math.max(0, end - start);
+    if (count === 0) return;
+    this.runBlock(leftIn, rightIn, start, count, outL, outR, start, null, 0, null, 0, count, 0, count, 0, false);
   }
 
   processRangeToPcm16Bytes(
@@ -2278,7 +2550,7 @@ export class Streaming8DBinaural {
     const headerSize = includeWavHeader ? 44 : 0;
     const buffer = new ArrayBuffer(headerSize + frameCount * 4);
     const view = includeWavHeader ? new DataView(buffer) : null;
-    let offset =
+    const offset =
       includeWavHeader && view ? writeStereoWavHeader(view, frameCount, this.sampleRate) : 0;
     const pcm16 = IS_LITTLE_ENDIAN
       ? new Int16Array(buffer, headerSize, frameCount * 2)
@@ -2286,26 +2558,109 @@ export class Streaming8DBinaural {
     const fallbackView = pcm16 ? null : view ?? new DataView(buffer);
     const fadeLen = applyEndFade ? Math.min(frameCount, 1024) : 0;
     const fadeStart = frameCount - fadeLen;
-    let pcmIdx = 0;
 
-    for (let f = 0; f < frameCount; f++) {
-      const i = startFrame + f;
-      let fade = 1.0;
-      if (applyEndFade && f >= fadeStart) {
-        fade = Math.max(0, Math.min(1, (frameCount - 1 - f) / fadeLen));
+    this.runBlock(
+      leftIn,
+      rightIn,
+      startFrame,
+      frameCount,
+      null,
+      null,
+      0,
+      pcm16,
+      0,
+      fallbackView,
+      offset,
+      frameCount,
+      0,
+      fadeStart,
+      fadeLen,
+      applyEndFade,
+    );
+
+    return new Uint8Array(buffer);
+  }
+
+  processInterleavedInt16StereoToPcm16Bytes(
+    pcm16In: Int16Array,
+    startFrame: number,
+    pcmFrameCount: number,
+    includeWavHeader: boolean,
+    applyEndFade: boolean,
+    carryLeft?: Float32Array | null,
+    carryRight?: Float32Array | null,
+  ): Uint8Array {
+    const carryCount =
+      carryLeft && carryRight ? Math.min(carryLeft.length, carryRight.length) : 0;
+    const totalFrames = carryCount + pcmFrameCount;
+    const headerSize = includeWavHeader ? 44 : 0;
+    const buffer = new ArrayBuffer(headerSize + totalFrames * 4);
+    const view = includeWavHeader ? new DataView(buffer) : null;
+    const offset =
+      includeWavHeader && view ? writeStereoWavHeader(view, totalFrames, this.sampleRate) : 0;
+    const outPcm16 = IS_LITTLE_ENDIAN
+      ? new Int16Array(buffer, headerSize, totalFrames * 2)
+      : null;
+    const fallbackView = outPcm16 ? null : view ?? new DataView(buffer);
+    const fadeLen = applyEndFade ? Math.min(totalFrames, 1024) : 0;
+    const fadeStart = totalFrames - fadeLen;
+    let outFramePos = 0;
+
+    if (carryCount > 0 && carryLeft && carryRight) {
+      for (let f = 0; f < carryCount; f += BLOCK_FRAMES) {
+        const count = Math.min(BLOCK_FRAMES, carryCount - f);
+        this.runBlock(
+          carryLeft,
+          carryRight,
+          f,
+          count,
+          null,
+          null,
+          0,
+          outPcm16,
+          outFramePos * 2,
+          fallbackView,
+          offset + outFramePos * 4,
+          totalFrames,
+          outFramePos,
+          fadeStart,
+          fadeLen,
+          applyEndFade,
+        );
+        outFramePos += count;
       }
-      this.processSample(leftIn[i], rightIn[i]);
-      const lOut = softLimit95(this.outL) * fade;
-      const rOut = softLimit95(this.outR) * fade;
-      if (pcm16) {
-        pcm16[pcmIdx] = floatToPcm16(lOut);
-        pcm16[pcmIdx + 1] = floatToPcm16(rOut);
-        pcmIdx += 2;
-      } else if (fallbackView) {
-        fallbackView.setInt16(offset, floatToPcm16(lOut), true);
-        fallbackView.setInt16(offset + 2, floatToPcm16(rOut), true);
-        offset += 4;
+    }
+
+    const scL = this.scratchInL;
+    const scR = this.scratchInR;
+    const inv32768 = 1 / 32768;
+
+    for (let f = 0; f < pcmFrameCount; f += BLOCK_FRAMES) {
+      const count = Math.min(BLOCK_FRAMES, pcmFrameCount - f);
+      let idx = (startFrame + f) * 2;
+      for (let k = 0; k < count; k++, idx += 2) {
+        scL[k] = pcm16In[idx] * inv32768;
+        scR[k] = pcm16In[idx + 1] * inv32768;
       }
+      this.runBlock(
+        scL,
+        scR,
+        0,
+        count,
+        null,
+        null,
+        0,
+        outPcm16,
+        outFramePos * 2,
+        fallbackView,
+        offset + outFramePos * 4,
+        totalFrames,
+        outFramePos,
+        fadeStart,
+        fadeLen,
+        applyEndFade,
+      );
+      outFramePos += count;
     }
 
     return new Uint8Array(buffer);

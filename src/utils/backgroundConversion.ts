@@ -359,6 +359,8 @@ class BackgroundConversionManager {
         nextProgress: progressPct,
         prevTimestampMs: this.lastEmitTime,
         nextTimestampMs: now,
+        minStepPct: 3,
+        minIntervalMs: 750,
       })
     ) {
       return;
