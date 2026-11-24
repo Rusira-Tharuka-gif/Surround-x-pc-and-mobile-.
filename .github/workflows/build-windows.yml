@@ -193,7 +193,7 @@ jobs:
         working-directory: ${{ runner.temp }}/repo
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
-        run: npx electron-builder --win --x64
+        run: npx electron-builder --win --x64 --publish never
 
       - name: Upload Windows .exe artifacts
         uses: actions/upload-artifact@v4

@@ -14,10 +14,10 @@
     "cap:sync": "npm run build && npx cap sync android",
     "electron:dev": "node electron/dev.mjs",
     "electron:start": "npm run build && electron .",
-    "electron:build": "npm run build && electron-builder --win",
-    "electron:build:nsis": "npm run build && electron-builder --win nsis",
-    "electron:build:portable": "npm run build && electron-builder --win portable",
-    "build:win": "npm run build && electron-builder --win"
+    "electron:build": "npm run build && electron-builder --win --publish never",
+    "electron:build:nsis": "npm run build && electron-builder --win nsis --publish never",
+    "electron:build:portable": "npm run build && electron-builder --win portable --publish never",
+    "build:win": "npm run build && electron-builder --win --publish never"
   },
   "dependencies": {
     "@capacitor/core": "^8.6.2",
@@ -65,6 +65,7 @@
       "package.json"
     ],
     "asar": true,
+    "publish": null,
     "win": {
       "icon": "build/icon.ico",
       "artifactName": "${productName}-${version}-win-${arch}.${ext}",
