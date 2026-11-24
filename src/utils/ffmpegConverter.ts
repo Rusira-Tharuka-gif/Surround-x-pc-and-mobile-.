@@ -1,4 +1,4 @@
-import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { FFFSType, FFmpeg } from '@ffmpeg/ffmpeg';
 import { toBlobURL } from '@ffmpeg/util';
 import type {
   Ac3BitrateKbps,
@@ -11,18 +11,16 @@ import type {
   UpmixProfile,
 } from './audioTypes';
 import {
+  buildFfmpegChunkDecodeArgs,
+  buildStereoWavHeaderBytes,
+  computeChunkWindows,
+} from './audioHeader';
+import {
   buildFfmpegArgsForFormat,
   buildOutputFilename,
   computeEffectiveChannelGains,
-  decodePcmWavToChannels,
-  encodeDiscreteSixChannelsToWav,
-  encodeMatrixUpmixStereoToSixChannelWav,
-  encodeStereo8dBinauralToWav,
-  encodeStereo8dBinauralWavChunks,
   isValidAc3Bitstream,
   sanitizeInputExtension,
-  Streaming8DBinaural,
-  StreamingMatrixUpmix51,
 } from './channelMath';
 
 let ffmpegSingleton: FFmpeg | null = null;
@@ -30,12 +28,14 @@ let loadPromise: Promise<FFmpeg> | null = null;
 let conversionInFlight = false;
 
 const TARGET_SAMPLE_RATE = 48000;
-const MAX_DURATION_SEC = 600;
-const MAX_FRAMES = MAX_DURATION_SEC * TARGET_SAMPLE_RATE;
+const CHUNK_DURATION_SEC = 20;
+const MAX_DURATION_SEC = 1800; // 30 minutes via streaming 20s chunks
 
 export interface ConvertOptions {
-  sourceBytes: Uint8Array;
-  sourceAudioBuffer?: AudioBuffer;
+  sourceFile?: File | Blob;
+  sourceBytes?: Uint8Array;
+  durationSec?: number;
+  sourceChannels?: number;
   sourceFilename: string;
   exportFormat?: ExportFormat;
   spatialContainer?: SpatialContainerFormat;
@@ -46,6 +46,90 @@ export interface ConvertOptions {
   onPhaseChange?: (phase: ConversionPhase) => void;
   onProgress?: (percent: number) => void;
   onLog?: (line: string) => void;
+}
+
+class DspWorkerClient {
+  private worker: Worker;
+  private nextId = 1;
+  private pending = new Map<
+    number,
+    { resolve: (val: unknown) => void; reject: (err: Error) => void }
+  >();
+
+  constructor() {
+    this.worker = new Worker(new URL('../workers/spatialDsp.worker.ts', import.meta.url), {
+      type: 'module',
+    });
+    this.worker.onmessage = (event: MessageEvent<{ id: number; ok: boolean; result?: unknown; error?: string }>) => {
+      const { id, ok, result, error } = event.data;
+      const entry = this.pending.get(id);
+      if (!entry) return;
+      this.pending.delete(id);
+      if (ok) {
+        entry.resolve(result);
+      } else {
+        entry.reject(new Error(error || 'Spatial DSP worker error'));
+      }
+    };
+    this.worker.onerror = (err) => {
+      const msg = err.message || 'Spatial DSP worker crashed';
+      for (const [, entry] of this.pending) {
+        entry.reject(new Error(msg));
+      }
+      this.pending.clear();
+    };
+  }
+
+  private call<T>(type: string, payload?: unknown, transfer: Transferable[] = []): Promise<T> {
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, {
+        resolve: resolve as (val: unknown) => void,
+        reject,
+      });
+      this.worker.postMessage(payload !== undefined ? { id, type, payload } : { id, type }, transfer);
+    });
+  }
+
+  init(payload: {
+    mode: '5.1' | '8d';
+    isDiscrete6Ch: boolean;
+    effectiveGains: Record<ChannelId, number>;
+    upmixProfile: UpmixProfile;
+    sampleRate: number;
+    orbitPeriodSec: number;
+  }): Promise<void> {
+    return this.call<void>('init', payload);
+  }
+
+  processChunk(
+    wavBytes: Uint8Array,
+    applyEndFade: boolean,
+    emitRawStereoPcm = false,
+  ): Promise<{ outBuffer: ArrayBuffer; byteLength: number }> {
+    const wavBuf =
+      wavBytes.byteOffset === 0 && wavBytes.byteLength === wavBytes.buffer.byteLength
+        ? (wavBytes.buffer as ArrayBuffer)
+        : (wavBytes.buffer.slice(wavBytes.byteOffset, wavBytes.byteOffset + wavBytes.byteLength) as ArrayBuffer);
+
+    return this.call<{ outBuffer: ArrayBuffer; byteLength: number }>(
+      'processChunk',
+      { wavBuffer: wavBuf, applyEndFade, emitRawStereoPcm },
+      [wavBuf],
+    );
+  }
+
+  finish(): Promise<{ channelRms: Record<ChannelId, number> }> {
+    return this.call<{ channelRms: Record<ChannelId, number> }>('finish');
+  }
+
+  terminate() {
+    for (const [, entry] of this.pending) {
+      entry.reject(new Error('Spatial DSP worker terminated'));
+    }
+    this.pending.clear();
+    this.worker.terminate();
+  }
 }
 
 function resetFfmpegWorker(): void {
@@ -103,125 +187,35 @@ async function getLoadedFfmpeg(): Promise<FFmpeg> {
   }
 }
 
-async function resampleBufferTo48kChannels(decoded: AudioBuffer): Promise<Float32Array[]> {
-  const srcChannels = Math.max(1, decoded.numberOfChannels);
-  const effectiveDuration = Math.min(decoded.duration, MAX_DURATION_SEC);
-  const targetLength = Math.max(1, Math.min(MAX_FRAMES, Math.ceil(effectiveDuration * TARGET_SAMPLE_RATE)));
+function parseProbeMetadataFromLogs(lines: string[]): {
+  durationSec: number | null;
+  sourceChannels: number | null;
+} {
+  let durationSec: number | null = null;
+  let sourceChannels: number | null = null;
 
-  // Zero-copy / zero-OfflineAudioContext fast path when source is already 48 kHz
-  if (decoded.sampleRate === TARGET_SAMPLE_RATE) {
-    const out: Float32Array[] = [];
-    for (let ch = 0; ch < srcChannels; ch++) {
-      const data = decoded.getChannelData(ch);
-      out.push(data.length > MAX_FRAMES ? data.subarray(0, MAX_FRAMES) : data);
+  for (const line of lines) {
+    const durMatch = line.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+    if (durMatch) {
+      const h = Number(durMatch[1]);
+      const m = Number(durMatch[2]);
+      const s = Number(durMatch[3]);
+      if (Number.isFinite(h) && Number.isFinite(m) && Number.isFinite(s)) {
+        durationSec = h * 3600 + m * 60 + s;
+      }
     }
-    if (out.length === 1) {
-      out.push(out[0]);
+    if (/Stream\s+#\d+:\d+.*Audio:/i.test(line)) {
+      if (/\b5\.1|\b6 channels\b|\b7\.1/i.test(line)) {
+        sourceChannels = 6;
+      } else if (/\bmono\b|\b1 channels\b/i.test(line)) {
+        sourceChannels = 1;
+      } else if (/\bstereo\b|\b2 channels\b/i.test(line)) {
+        sourceChannels = 2;
+      }
     }
-    return out;
   }
 
-  // Resample in bounded 60-second chunks so OfflineAudioContext never spikes memory on long tracks
-  const OfflineCtx =
-    window.OfflineAudioContext ||
-    (window as unknown as { webkitOfflineAudioContext: typeof OfflineAudioContext })
-      .webkitOfflineAudioContext;
-
-  const chunkSec = 24;
-  if (effectiveDuration <= chunkSec) {
-    const offline = new OfflineCtx(srcChannels, targetLength, TARGET_SAMPLE_RATE);
-    const source = offline.createBufferSource();
-    source.buffer = decoded;
-    source.connect(offline.destination);
-    source.start(0, 0, effectiveDuration);
-    const working = await offline.startRendering();
-    source.disconnect();
-    source.buffer = null;
-
-    const out: Float32Array[] = [];
-    for (let ch = 0; ch < working.numberOfChannels; ch++) {
-      out.push(new Float32Array(working.getChannelData(ch)));
-    }
-    if (out.length === 1) {
-      out.push(out[0]);
-    }
-    return out;
-  }
-
-  const out: Float32Array[] = Array.from({ length: srcChannels }, () => new Float32Array(targetLength));
-  let writeFrame = 0;
-  for (let startSec = 0; startSec < effectiveDuration && writeFrame < targetLength; startSec += chunkSec) {
-    const segDur = Math.min(chunkSec, effectiveDuration - startSec);
-    const segFrames = Math.min(targetLength - writeFrame, Math.max(1, Math.round(segDur * TARGET_SAMPLE_RATE)));
-    const offline = new OfflineCtx(srcChannels, segFrames, TARGET_SAMPLE_RATE);
-    const source = offline.createBufferSource();
-    source.buffer = decoded;
-    source.connect(offline.destination);
-    source.start(0, startSec, segDur);
-    const rendered = await offline.startRendering();
-    source.disconnect();
-    source.buffer = null;
-
-    const copyLen = Math.min(segFrames, rendered.length, targetLength - writeFrame);
-    for (let ch = 0; ch < srcChannels; ch++) {
-      out[ch].set(rendered.getChannelData(ch).subarray(0, copyLen), writeFrame);
-    }
-    writeFrame += copyLen;
-  }
-
-  if (out.length === 1) {
-    out.push(out[0]);
-  }
-  return out;
-}
-
-async function decodeViaFfmpegToChannels(
-  ffmpeg: FFmpeg,
-  sourceBytes: Uint8Array,
-  sourceFilename: string,
-  runId: string,
-): Promise<{ channels: Float32Array[]; sampleRate: number }> {
-  const ext = sanitizeInputExtension(sourceFilename);
-  const virtualRawInputName = `raw_${runId}.${ext}`;
-  const virtualDecodedWavName = `decoded_${runId}.wav`;
-
-  try {
-    await ffmpeg.writeFile(virtualRawInputName, sourceBytes);
-    const decExit = await ffmpeg.exec([
-      '-y',
-      '-i',
-      virtualRawInputName,
-      '-vn',
-      '-t',
-      String(MAX_DURATION_SEC),
-      '-ar',
-      String(TARGET_SAMPLE_RATE),
-      '-ac',
-      '2',
-      '-c:a',
-      'pcm_s16le',
-      virtualDecodedWavName,
-    ]);
-
-    await ffmpeg.deleteFile(virtualRawInputName).catch(() => undefined);
-
-    if (decExit !== 0) {
-      throw new Error(`FFmpeg could not decode input audio container (exit code ${decExit}).`);
-    }
-
-    const pcmBytes = await ffmpeg.readFile(virtualDecodedWavName);
-    await ffmpeg.deleteFile(virtualDecodedWavName).catch(() => undefined);
-
-    if (!(pcmBytes instanceof Uint8Array) || pcmBytes.byteLength < 44) {
-      throw new Error('FFmpeg produced an empty intermediate PCM stream.');
-    }
-
-    const decoded = decodePcmWavToChannels(pcmBytes, MAX_FRAMES);
-    return decoded;
-  } finally {
-    await ffmpeg.deleteFile(virtualRawInputName).catch(() => undefined);
-    await ffmpeg.deleteFile(virtualDecodedWavName).catch(() => undefined);
-  }
+  return { durationSec, sourceChannels };
 }
 
 function formatFriendlyError(err: unknown, recentLogs: string[]): string {
@@ -232,7 +226,7 @@ function formatFriendlyError(err: unknown, recentLogs: string[]): string {
     return 'Browser threading restriction detected. Please reload the page and try again.';
   }
   if (isMemoryAllocationError(err)) {
-    return 'Browser memory or WebAssembly allocation limit reached on this device. Try an audio file under 100 MB or a shorter track.';
+    return 'Browser memory or WebAssembly allocation limit reached on this device. Try a shorter track or close background tabs.';
   }
   if (lower.includes('invalid data') || lower.includes('could not find codec') || lower.includes('moov atom')) {
     return 'Unable to decode this audio container. Please verify the file is a valid MP3, WAV, FLAC, M4A, AAC, or OGG audio track.';
@@ -283,8 +277,10 @@ function getCodecLabel(
 
 export async function convertAudioToAc3(options: ConvertOptions): Promise<ConversionResult> {
   const {
+    sourceFile,
     sourceBytes,
-    sourceAudioBuffer,
+    durationSec = 0,
+    sourceChannels = 2,
     sourceFilename,
     exportFormat = 'ac3',
     spatialContainer = 'mp3',
@@ -297,8 +293,10 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     onLog,
   } = options;
 
-  if (!sourceBytes || sourceBytes.byteLength === 0) {
-    throw new Error('No audio data found in the uploaded file buffer.');
+  const hasValidFile = sourceFile && sourceFile.size > 0;
+  const hasValidBytes = sourceBytes && sourceBytes.byteLength > 0;
+  if (!hasValidFile && !hasValidBytes) {
+    throw new Error('No audio source provided for conversion.');
   }
   if (conversionInFlight) {
     throw new Error('Another conversion is already in progress. Please wait for it to finish.');
@@ -322,479 +320,374 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
   };
 
   let ffmpeg: FFmpeg | null = null;
-  let virtualStageWavName = '';
-  let virtualOutputName = '';
+  let dspWorker: DspWorkerClient | null = null;
+  let mountDir = '';
+  let fallbackRawName = '';
   let runId = '';
   let outExt = '';
+  const flacSegmentFiles: string[] = [];
+  let flacListFile = '';
+  let virtualOutputName = '';
+  let chunkDecWav = '';
+  let chunkSegIn = '';
+  let chunkSegOut = '';
 
   const ffmpegLogListener = ({ message }: { message: string }) => {
     recentLogs.push(message);
-    if (recentLogs.length > 50) recentLogs.shift();
+    if (recentLogs.length > 60) recentLogs.shift();
     console.debug('[Surround X][FFmpeg]', message);
-  };
-
-  let encodePassActive = false;
-  const progressHandler = ({ progress }: { progress: number }) => {
-    if (!encodePassActive || !Number.isFinite(progress)) return;
-    const safe = Math.max(0, Math.min(1, progress));
-    emitProgress(46 + safe * 50);
   };
 
   const attachFfmpegListeners = (instance: FFmpeg) => {
     instance.on('log', ffmpegLogListener);
-    instance.on('progress', progressHandler);
   };
 
   const detachFfmpegListeners = (instance: FFmpeg | null) => {
-    instance?.off('progress', progressHandler);
     instance?.off('log', ffmpegLogListener);
   };
 
-  const needsFfmpegEncoder = !(exportFormat === '8d-spatial' && spatialContainer === 'wav');
-
   try {
     onPhaseChange?.('loading-engine');
-    emitProgress(5);
+    emitProgress(4);
     pushStatus(
       exportFormat === '8d-spatial'
-        ? 'Initializing 8D Binaural Spatial DSP & encoder...'
-        : `Initializing FFmpeg WebAssembly ${exportFormat.toUpperCase()} engine...`,
+        ? 'Initializing WASM streaming decoder & 8D DSP worker...'
+        : `Initializing FFmpeg WASM & ${exportFormat.toUpperCase()} streaming worker...`,
     );
 
-    let decodedChannels: Float32Array[] | null = null;
+    ffmpeg = await getLoadedFfmpeg();
+    attachFfmpegListeners(ffmpeg);
+    dspWorker = new DspWorkerClient();
 
-    // Step 1: Reuse already-decoded AudioBuffer if available, otherwise decode via Web Audio
+    runId = Date.now().toString(36);
+    const ext = sanitizeInputExtension(sourceFilename);
+    outExt = exportFormat === 'dts' ? 'dts' : exportFormat === 'flac' ? 'flac' : 'ac3';
+
     onPhaseChange?.('preparing-audio');
-    emitProgress(12);
-    if (sourceAudioBuffer) {
-      pushStatus(
-        `Preparing ${sourceAudioBuffer.numberOfChannels}ch ${sourceAudioBuffer.sampleRate.toLocaleString()} Hz source (${sourceAudioBuffer.duration.toFixed(1)}s)`,
-      );
-      decodedChannels = await resampleBufferTo48kChannels(sourceAudioBuffer);
-    } else {
-      try {
-        const OfflineCtx =
-          window.OfflineAudioContext ||
-          (window as unknown as { webkitOfflineAudioContext: typeof OfflineAudioContext })
-            .webkitOfflineAudioContext;
-        if (OfflineCtx && sourceBytes.byteLength < 60 * 1024 * 1024) {
-          const tempCtx = new OfflineCtx(2, 1, TARGET_SAMPLE_RATE);
-          const audioDataBuffer = sourceBytes.buffer.slice(
-            sourceBytes.byteOffset,
-            sourceBytes.byteOffset + sourceBytes.byteLength,
-          ) as ArrayBuffer;
-          const decoded = await tempCtx.decodeAudioData(audioDataBuffer);
-          pushStatus(
-            `Decoded ${decoded.numberOfChannels}ch ${decoded.sampleRate.toLocaleString()} Hz source (${decoded.duration.toFixed(1)}s)`,
-          );
-          decodedChannels = await resampleBufferTo48kChannels(decoded);
-        } else {
-          pushStatus('Large audio file detected. Routing through FFmpeg streaming decoder...');
-        }
-      } catch (decodeErr) {
-        console.warn('[Surround X][DSP] Browser decode skipped, falling back to FFmpeg PCM pass:', decodeErr);
-        pushStatus('Decoding container stream to 48 kHz PCM via FFmpeg...');
-      }
-    }
+    emitProgress(10);
 
-    if (needsFfmpegEncoder || !decodedChannels) {
-      ffmpeg = await getLoadedFfmpeg();
-      attachFfmpegListeners(ffmpeg);
-    }
+    // Zero-RAM WORKERFS stream mount (falls back to MEMFS only if WORKERFS unavailable)
+    let inputPath = '';
+    const workerMountPath = `/in_${runId}`;
+    const safeMountFileName = `src_${runId}.${ext}`;
+    const fileToMount =
+      sourceFile instanceof File
+        ? sourceFile
+        : sourceFile instanceof Blob
+          ? sourceFile
+          : new Blob([sourceBytes as unknown as BlobPart]);
 
+    let mountedViaWorkerFs = false;
     try {
-      runId = Date.now().toString(36);
-      outExt = exportFormat === 'dts' ? 'dts' : exportFormat === 'flac' ? 'flac' : 'ac3';
-
-      if (!decodedChannels && ffmpeg) {
-        const parsed = await decodeViaFfmpegToChannels(ffmpeg, sourceBytes, sourceFilename, runId);
-        decodedChannels = parsed.channels;
-        pushStatus(`Decoded container stream to ${decodedChannels.length}ch 48,000 Hz PCM`);
-      }
-
-      if (!decodedChannels) {
-        throw new Error('Unable to decode source audio stream.');
-      }
-
-      emitProgress(24);
-      const effectiveGains = computeEffectiveChannelGains(channels);
-
-      // ==================== BRANCH A: 8D BINAURAL SPATIAL PROCESSING ====================
-      if (exportFormat === '8d-spatial') {
-        onPhaseChange?.('processing-8d');
-        emitProgress(34);
-        pushStatus(
-          `Applying 360° binaural panning, ITD & pinna frequency filter (${orbitPeriodSec.toFixed(1)}s/rev)...`,
-        );
-
-        await new Promise((r) => setTimeout(r, 80));
-
-        const srcL = decodedChannels[0];
-        const srcR = decodedChannels[1] ?? srcL;
-        const outputFilename = buildOutputFilename(sourceFilename, '8d-spatial', spatialContainer);
-
-        if (spatialContainer === 'wav') {
-          // Streamed 15-second chunks directly to Blob -> < 5 MB peak RAM!
-          const { chunks, totalBytes } = encodeStereo8dBinauralWavChunks(
-            srcL,
-            srcR,
-            {
-              sampleRate: TARGET_SAMPLE_RATE,
-              orbitPeriodSec,
-              reverbMix: 0.25,
-              bassAnchor: 0.28,
-            },
-            15,
-          );
-          decodedChannels = null;
-
-          onPhaseChange?.('encoding-output');
-          emitProgress(88);
-          await new Promise((r) => setTimeout(r, 80));
-
-          const blob = new Blob(chunks as unknown as BlobPart[], {
-            type: getMimeTypeForExport('8d-spatial', spatialContainer),
-          });
-          const url = URL.createObjectURL(blob);
-
-          emitProgress(100);
-          onPhaseChange?.('completed');
-
-          const elapsedMs = Math.round(performance.now() - startedAt);
-          pushStatus(
-            `Mastered 8D Spatial 48 kHz lossless WAV (${totalBytes.toLocaleString()} B in ${elapsedMs} ms)`,
-          );
-
-          return {
-            blob,
-            url,
-            outputFilename,
-            sizeBytes: totalBytes,
-            format: '8d-spatial',
-            codecLabel: getCodecLabel('8d-spatial', spatialContainer, bitrateKbps),
-            sampleRate: TARGET_SAMPLE_RATE,
-            channels: 2,
-            elapsedMs,
-            usedCustomMix: true,
-            statusLogs,
-          };
-        }
-
-        // 8D MP3 branch: proactive 20-second chunked streaming into FFmpeg MP3 encoder (< 5 MB peak RAM)
-        if (!ffmpeg) {
-          throw new Error('FFmpeg MP3 encoder failed to initialize.');
-        }
-        const ffmpegInstance = ffmpeg;
-        const totalFrames = Math.min(srcL.length, srcR.length, MAX_FRAMES);
-        const CHUNK_FRAMES = TARGET_SAMPLE_RATE * 20;
-        const processor = new Streaming8DBinaural({
-          sampleRate: TARGET_SAMPLE_RATE,
-          orbitPeriodSec,
-          reverbMix: 0.25,
-          bassAnchor: 0.28,
-        });
-
-        const mp3Parts: Uint8Array[] = [];
-        let mp3Bytes = 0;
-        onPhaseChange?.('encoding-output');
-        emitProgress(48);
-
-        const segIn = `seg8d_in_${runId}.wav`;
-        const segOut = `seg8d_out_${runId}.mp3`;
-
-        for (let start = 0, partIdx = 0; start < totalFrames; start += CHUNK_FRAMES, partIdx++) {
-          const count = Math.min(CHUNK_FRAMES, totalFrames - start);
-          const isLast = start + count >= totalFrames;
-          let partWav: Uint8Array | null = processor.processRangeToPcm16Bytes(
-            srcL,
-            srcR,
-            start,
-            count,
-            true,
-            totalFrames === MAX_FRAMES && isLast,
-          );
-
-          await ffmpegInstance.writeFile(segIn, partWav);
-          partWav = null; // Explicitly drop JS reference immediately to allow GC
-
-          const exitCode = await ffmpegInstance.exec([
-            '-y',
-            '-i',
-            segIn,
-            '-vn',
-            '-c:a',
-            'libmp3lame',
-            '-b:a',
-            '320k',
-            '-write_xing',
-            '0',
-            '-id3v2_version',
-            '0',
-            '-ar',
-            '48000',
-            '-ac',
-            '2',
-            segOut,
-          ]);
-          await ffmpegInstance.deleteFile(segIn).catch(() => undefined);
-
-          if (exitCode !== 0) {
-            throw new Error(`FFmpeg 8D MP3 segment encoder returned exit code (${exitCode}).`);
-          }
-          const segBytes = await ffmpegInstance.readFile(segOut);
-          await ffmpegInstance.deleteFile(segOut).catch(() => undefined);
-
-          if (!(segBytes instanceof Uint8Array) || segBytes.byteLength === 0) {
-            throw new Error('FFmpeg produced an empty 8D MP3 segment.');
-          }
-          mp3Parts.push(segBytes);
-          mp3Bytes += segBytes.byteLength;
-          emitProgress(50 + ((start + count) / totalFrames) * 46);
-        }
-
-        decodedChannels = null;
-        const blob = new Blob(mp3Parts as unknown as BlobPart[], {
-          type: getMimeTypeForExport('8d-spatial', spatialContainer),
-        });
-        const url = URL.createObjectURL(blob);
-
-        emitProgress(100);
-        onPhaseChange?.('completed');
-
-        const elapsedMs = Math.round(performance.now() - startedAt);
-        pushStatus(
-          `Verified 8D Spatial output: ${outputFilename} (${mp3Bytes.toLocaleString()} B in ${elapsedMs} ms)`,
-        );
-
-        return {
-          blob,
-          url,
-          outputFilename,
-          sizeBytes: mp3Bytes,
-          format: '8d-spatial',
-          codecLabel: getCodecLabel('8d-spatial', spatialContainer, bitrateKbps),
-          bitrateKbps: 320,
-          sampleRate: TARGET_SAMPLE_RATE,
-          channels: 2,
-          elapsedMs,
-          usedCustomMix: true,
-          statusLogs,
-        };
-      }
-
-      // ==================== BRANCH B: DISCRETE 5.1 MULTI-CHANNEL (AC3 / DTS / FLAC) ====================
-      const isDiscrete6Ch = decodedChannels.length >= 6;
-      const backupChannels = decodedChannels;
-      const outputFilename = buildOutputFilename(sourceFilename, exportFormat, spatialContainer);
-      const totalFrames = Math.min(backupChannels[0]?.length ?? 0, MAX_FRAMES);
-
-      let channelRms: Record<ChannelId, number> = {
-        FL: 0,
-        FR: 0,
-        C: 0,
-        LFE: 0,
-        SL: 0,
-        SR: 0,
-      };
-      let outputBlobParts: Uint8Array[] = [];
-      let outputByteSize = 0;
-
-      if (!ffmpeg) {
-        throw new Error('FFmpeg WebAssembly engine failed to initialize.');
-      }
-
-      onPhaseChange?.(exportFormat === 'ac3' ? 'encoding-ac3' : 'encoding-output');
-      encodePassActive = true;
-
-      // 960,000 samples = 20.0 seconds @ 48 kHz
-      // Exact integer multiple of 1,536 (AC3 = 625 frames) and 512 (DTS = 1,875 frames)
-      // Peak 6-channel PCM16 WAV chunk is ONLY 11.0 MB!
-      const CHUNK_FRAMES = 960000;
-
-      if (exportFormat === 'ac3' || exportFormat === 'dts') {
-        // PROACTIVE BOUNDED-CHUNK 5.1 STREAMING:
-        // Processes audio in memory-safe ~11 MB blocks, guaranteeing mobile browser heap limits (< 25 MB) are never breached!
-        pushStatus(
-          `Streaming 6-channel 5.1 ${exportFormat.toUpperCase()} in bounded 20s blocks (${getCodecLabel(exportFormat, spatialContainer, bitrateKbps)})...`,
-        );
-
-        const sumSq = new Float64Array(6);
-        const upmixer = isDiscrete6Ch
-          ? null
-          : new StreamingMatrixUpmix51(effectiveGains, upmixProfile, TARGET_SAMPLE_RATE);
-        const left = backupChannels[0];
-        const right = backupChannels[1] ?? left;
-
-        const segIn = `seg51_in_${runId}.wav`;
-        const segOut = `seg51_out_${runId}.${outExt}`;
-
-        for (let start = 0, partIdx = 0; start < totalFrames; start += CHUNK_FRAMES, partIdx++) {
-          const count = Math.min(CHUNK_FRAMES, totalFrames - start);
-          const isLast = start + count >= totalFrames;
-
-          let segWav: Uint8Array | null = null;
-          if (isDiscrete6Ch) {
-            segWav = encodeDiscreteSixChannelsToWav(
-              backupChannels,
-              effectiveGains,
-              TARGET_SAMPLE_RATE,
-              start,
-              count,
-              sumSq,
-            ).wavBytes;
-          } else {
-            segWav = upmixer!.processRangeToWavBytes(
-              left,
-              right,
-              start,
-              count,
-              TARGET_SAMPLE_RATE,
-              sumSq,
-              totalFrames === MAX_FRAMES && isLast,
-            );
-          }
-
-          // Transfer segWav directly into WASM MEMFS
-          await ffmpeg.writeFile(segIn, segWav);
-          segWav = null; // Explicitly drop JS reference immediately to allow GC
-
-          const segArgs = buildFfmpegArgsForFormat(segIn, segOut, exportFormat, { bitrateKbps });
-          const segExit = await ffmpeg.exec(segArgs);
-          await ffmpeg.deleteFile(segIn).catch(() => undefined); // Free WASM input WAV immediately!
-
-          if (segExit !== 0) {
-            throw new Error(`FFmpeg ${exportFormat.toUpperCase()} encoder failed (exit ${segExit}).`);
-          }
-
-          const segBytes = await ffmpeg.readFile(segOut);
-          await ffmpeg.deleteFile(segOut).catch(() => undefined); // Free WASM output immediately!
-
-          if (!(segBytes instanceof Uint8Array) || segBytes.byteLength === 0) {
-            throw new Error(`FFmpeg produced an empty ${exportFormat.toUpperCase()} segment.`);
-          }
-          if (partIdx === 0 && exportFormat === 'ac3' && !isValidAc3Bitstream(segBytes)) {
-            throw new Error('Output stream failed Dolby Digital AC3 syncword verification.');
-          }
-
-          outputBlobParts.push(segBytes);
-          outputByteSize += segBytes.byteLength;
-          emitProgress(40 + ((start + count) / totalFrames) * 56);
-        }
-
-        decodedChannels = null;
-        const sampleCount = Math.max(1, Math.ceil(totalFrames / 64));
-        channelRms = {
-          FL: Math.min(1, Math.sqrt(sumSq[0] / sampleCount)),
-          FR: Math.min(1, Math.sqrt(sumSq[1] / sampleCount)),
-          C: Math.min(1, Math.sqrt(sumSq[2] / sampleCount)),
-          LFE: Math.min(1, Math.sqrt(sumSq[3] / sampleCount)),
-          SL: Math.min(1, Math.sqrt(sumSq[4] / sampleCount)),
-          SR: Math.min(1, Math.sqrt(sumSq[5] / sampleCount)),
-        };
+      await ffmpeg.createDir(workerMountPath);
+      if (fileToMount instanceof File) {
+        await ffmpeg.mount(FFFSType.WORKERFS, { files: [fileToMount] }, workerMountPath);
+        inputPath = `${workerMountPath}/${fileToMount.name}`;
       } else {
-        // FLAC branch: Lossless multi-channel FLAC
-        let stageWavBytes: Uint8Array | null = null;
-        if (isDiscrete6Ch) {
-          const encoded = encodeDiscreteSixChannelsToWav(backupChannels, effectiveGains, TARGET_SAMPLE_RATE);
-          stageWavBytes = encoded.wavBytes;
-          channelRms = encoded.channelRms;
-          pushStatus('Preserved 6 discrete source channels (FL · FR · C · LFE · SL · SR)');
-        } else {
-          const left = backupChannels[0];
-          const right = backupChannels[1] ?? left;
-          const encoded = encodeMatrixUpmixStereoToSixChannelWav(
-            left,
-            right,
-            effectiveGains,
-            upmixProfile,
-            TARGET_SAMPLE_RATE,
-          );
-          stageWavBytes = encoded.wavBytes;
-          channelRms = encoded.channelRms;
-          pushStatus(
-            `Separated stereo into 6 discrete 5.1 channels (${upmixProfile} · 120 Hz LR24 LFE)`,
-          );
+        await ffmpeg.mount(
+          FFFSType.WORKERFS,
+          { blobs: [{ name: safeMountFileName, data: fileToMount }] },
+          workerMountPath,
+        );
+        inputPath = `${workerMountPath}/${safeMountFileName}`;
+      }
+      mountDir = workerMountPath;
+      mountedViaWorkerFs = true;
+      pushStatus(
+        `Mounted stream directly via WORKERFS (${(fileToMount.size / (1024 * 1024)).toFixed(1)} MB zero-copy)`,
+      );
+    } catch (mountErr) {
+      console.warn('[Surround X][WORKERFS] Falling back to MEMFS write:', mountErr);
+      fallbackRawName = `raw_${runId}.${ext}`;
+      const bytesToWrite =
+        sourceBytes ?? new Uint8Array(await fileToMount.arrayBuffer());
+      await ffmpeg.writeFile(fallbackRawName, bytesToWrite);
+      inputPath = fallbackRawName;
+    }
+
+    // Probe stream metadata if browser metadata duration wasn't already resolved
+    let resolvedDurationSec = durationSec;
+    let resolvedSourceChannels = sourceChannels;
+    if (resolvedDurationSec <= 0) {
+      await ffmpeg.exec(['-i', inputPath]).catch(() => 1);
+      const probed = parseProbeMetadataFromLogs(recentLogs);
+      if (probed.durationSec && probed.durationSec > 0) {
+        resolvedDurationSec = probed.durationSec;
+      }
+      if (probed.sourceChannels && probed.sourceChannels > 0) {
+        resolvedSourceChannels = probed.sourceChannels;
+      }
+    }
+    if (resolvedDurationSec <= 0) {
+      resolvedDurationSec = CHUNK_DURATION_SEC;
+    }
+
+    const is8dMode = exportFormat === '8d-spatial';
+    const isDiscrete6Ch = !is8dMode && resolvedSourceChannels >= 6;
+    const decodeChannels = isDiscrete6Ch ? 6 : 2;
+    const windows = computeChunkWindows(
+      resolvedDurationSec,
+      CHUNK_DURATION_SEC,
+      MAX_DURATION_SEC,
+    );
+    const effectiveGains = computeEffectiveChannelGains(channels);
+
+    pushStatus(
+      `Streaming ${windows.length} ${windows.length === 1 ? 'block' : 'blocks'} (${Math.round(resolvedDurationSec)}s · ${decodeChannels}ch @ 48 kHz)${mountedViaWorkerFs ? '' : ' [MEMFS]'}`,
+    );
+
+    await dspWorker.init({
+      mode: is8dMode ? '8d' : '5.1',
+      isDiscrete6Ch,
+      effectiveGains,
+      upmixProfile,
+      sampleRate: TARGET_SAMPLE_RATE,
+      orbitPeriodSec,
+    });
+
+    emitProgress(16);
+
+    if (is8dMode) {
+      onPhaseChange?.('processing-8d');
+    } else if (exportFormat === 'ac3') {
+      onPhaseChange?.('encoding-ac3');
+    } else {
+      onPhaseChange?.('encoding-output');
+    }
+
+    chunkDecWav = `dec_${runId}.wav`;
+    chunkSegIn = `seg_in_${runId}.wav`;
+    chunkSegOut = `seg_out_${runId}.${is8dMode ? 'mp3' : outExt}`;
+
+    const outputBlobParts: Uint8Array[] = [];
+    let outputByteSize = 0;
+    let totalRawPcmBytes = 0;
+
+    for (let i = 0; i < windows.length; i++) {
+      const win = windows[i];
+      const isLast = i === windows.length - 1;
+      const decodeDur = isLast ? win.durationSec + 8 : win.durationSec;
+
+      const decArgs = buildFfmpegChunkDecodeArgs({
+        inputPath,
+        outputWavPath: chunkDecWav,
+        startSec: win.startSec,
+        durationSec: decodeDur,
+        targetSampleRate: TARGET_SAMPLE_RATE,
+        decodeChannels,
+        inputExt: ext,
+      });
+
+      const decExit = await ffmpeg.exec(decArgs);
+      if (decExit !== 0) {
+        if (i > 0) {
+          await ffmpeg.deleteFile(chunkDecWav).catch(() => undefined);
+          break;
+        }
+        throw new Error(`FFmpeg could not decode input audio container (exit code ${decExit}).`);
+      }
+
+      const rawWavBytes = await ffmpeg.readFile(chunkDecWav);
+      await ffmpeg.deleteFile(chunkDecWav).catch(() => undefined);
+
+      if (!(rawWavBytes instanceof Uint8Array) || rawWavBytes.byteLength <= 44) {
+        if (i > 0) break;
+        throw new Error('FFmpeg produced an empty intermediate PCM stream.');
+      }
+
+      const shouldFadeEnd = isLast && resolvedDurationSec >= MAX_DURATION_SEC - 1;
+      const emitRawPcm = is8dMode && spatialContainer === 'wav';
+
+      // Process chunk EQ + 5.1 upmix or 8D spatial off main thread via Transferable buffers
+      const workerRes = await dspWorker.processChunk(rawWavBytes, shouldFadeEnd, emitRawPcm);
+      if (workerRes.byteLength === 0) {
+        if (i > 0) break;
+        throw new Error('Spatial DSP worker returned an empty audio block.');
+      }
+
+      const processedBytes = new Uint8Array(workerRes.outBuffer, 0, workerRes.byteLength);
+
+      if (is8dMode && spatialContainer === 'wav') {
+        outputBlobParts.push(processedBytes);
+        totalRawPcmBytes += processedBytes.byteLength;
+      } else if (is8dMode) {
+        await ffmpeg.writeFile(chunkSegIn, processedBytes);
+        const encExit = await ffmpeg.exec([
+          '-y',
+          '-i',
+          chunkSegIn,
+          '-vn',
+          '-c:a',
+          'libmp3lame',
+          '-b:a',
+          '320k',
+          '-write_xing',
+          '0',
+          '-id3v2_version',
+          '0',
+          '-ar',
+          String(TARGET_SAMPLE_RATE),
+          '-ac',
+          '2',
+          chunkSegOut,
+        ]);
+        await ffmpeg.deleteFile(chunkSegIn).catch(() => undefined);
+
+        if (encExit !== 0) {
+          throw new Error(`FFmpeg 8D MP3 segment encoder returned exit code (${encExit}).`);
         }
 
-        decodedChannels = null;
-        emitProgress(38);
+        const mp3Seg = await ffmpeg.readFile(chunkSegOut);
+        await ffmpeg.deleteFile(chunkSegOut).catch(() => undefined);
+        if (!(mp3Seg instanceof Uint8Array) || mp3Seg.byteLength === 0) {
+          throw new Error('FFmpeg produced an empty 8D MP3 segment.');
+        }
+        outputBlobParts.push(mp3Seg);
+        outputByteSize += mp3Seg.byteLength;
+      } else if (exportFormat === 'flac') {
+        await ffmpeg.writeFile(chunkSegIn, processedBytes);
+        const flacSegName = `flac_${runId}_${i}.flac`;
+        const encArgs = buildFfmpegArgsForFormat(chunkSegIn, flacSegName, 'flac', { bitrateKbps });
+        const encExit = await ffmpeg.exec(encArgs);
+        await ffmpeg.deleteFile(chunkSegIn).catch(() => undefined);
 
-        virtualStageWavName = `stage51_${runId}.wav`;
-        virtualOutputName = `output_${runId}.${outExt}`;
-
-        await ffmpeg.writeFile(virtualStageWavName, stageWavBytes);
-        stageWavBytes = null; // Free JS copy immediately before FFmpeg execution!
-
-        emitProgress(44);
-        const args = buildFfmpegArgsForFormat(virtualStageWavName, virtualOutputName, exportFormat, {
+        if (encExit !== 0) {
+          throw new Error(`FFmpeg FLAC segment encoder returned exit code (${encExit}).`);
+        }
+        flacSegmentFiles.push(flacSegName);
+      } else {
+        // 5.1 AC3 / DTS bounded chunk encoding (~11 MB WAV -> compact bitstream segment)
+        await ffmpeg.writeFile(chunkSegIn, processedBytes);
+        const encArgs = buildFfmpegArgsForFormat(chunkSegIn, chunkSegOut, exportFormat, {
           bitrateKbps,
         });
-        pushStatus(
-          `Encoding 6-channel 5.1 ${exportFormat.toUpperCase()} stream (${getCodecLabel(exportFormat, spatialContainer, bitrateKbps)} · 48 kHz)...`,
-        );
+        const encExit = await ffmpeg.exec(encArgs);
+        await ffmpeg.deleteFile(chunkSegIn).catch(() => undefined);
 
-        const exitCode = await ffmpeg.exec(args);
-        await ffmpeg.deleteFile(virtualStageWavName).catch(() => undefined);
-
-        if (exitCode !== 0) {
-          throw new Error(`FFmpeg FLAC encoder returned non-zero exit code (${exitCode}).`);
+        if (encExit !== 0) {
+          throw new Error(`FFmpeg ${exportFormat.toUpperCase()} encoder failed (exit ${encExit}).`);
         }
 
-        const rawOutput = await ffmpeg.readFile(virtualOutputName);
-        await ffmpeg.deleteFile(virtualOutputName).catch(() => undefined);
+        const segOutBytes = await ffmpeg.readFile(chunkSegOut);
+        await ffmpeg.deleteFile(chunkSegOut).catch(() => undefined);
 
-        if (!(rawOutput instanceof Uint8Array) || rawOutput.byteLength === 0) {
-          throw new Error('FFmpeg finished without writing a valid FLAC stream.');
+        if (!(segOutBytes instanceof Uint8Array) || segOutBytes.byteLength === 0) {
+          throw new Error(`FFmpeg produced an empty ${exportFormat.toUpperCase()} segment.`);
+        }
+        if (i === 0 && exportFormat === 'ac3' && !isValidAc3Bitstream(segOutBytes)) {
+          throw new Error('Output stream failed Dolby Digital AC3 syncword verification.');
         }
 
-        outputBlobParts = [rawOutput];
-        outputByteSize = rawOutput.byteLength;
+        outputBlobParts.push(segOutBytes);
+        outputByteSize += segOutBytes.byteLength;
       }
 
-      const blob = new Blob(outputBlobParts as unknown as BlobPart[], {
-        type: getMimeTypeForExport(exportFormat, spatialContainer),
-      });
-      const url = URL.createObjectURL(blob);
+      const progressSpan = exportFormat === 'flac' ? 68 : 78;
+      emitProgress(16 + ((i + 1) / windows.length) * progressSpan);
+    }
 
-      emitProgress(100);
-      onPhaseChange?.('completed');
+    onPhaseChange?.('encoding-output');
 
-      const elapsedMs = Math.round(performance.now() - startedAt);
-      pushStatus(
-        `Verified 5.1 ${exportFormat.toUpperCase()} output: ${outputFilename} (${outputByteSize.toLocaleString()} B in ${elapsedMs} ms)`,
-      );
-
-      return {
-        blob,
-        url,
-        outputFilename,
-        sizeBytes: outputByteSize,
-        format: exportFormat,
-        codecLabel: getCodecLabel(exportFormat, spatialContainer, bitrateKbps),
-        bitrateKbps: exportFormat === 'ac3' ? bitrateKbps : exportFormat === 'dts' ? 768 : undefined,
-        sampleRate: TARGET_SAMPLE_RATE,
-        channels: 6,
-        elapsedMs,
-        usedCustomMix: true,
-        channelRms,
-        statusLogs,
-      };
-    } finally {
-      encodePassActive = false;
-      detachFfmpegListeners(ffmpeg);
-      for (const fname of [
-        `seg51_in_${runId}.wav`,
-        `seg51_out_${runId}.${outExt}`,
-        `seg8d_in_${runId}.wav`,
-        `seg8d_out_${runId}.mp3`,
-        virtualStageWavName,
-        virtualOutputName,
-      ]) {
-        if (fname && ffmpeg) {
-          await ffmpeg.deleteFile(fname).catch(() => undefined);
+    if (exportFormat === 'flac') {
+      if (flacSegmentFiles.length === 0) {
+        throw new Error('FFmpeg finished without writing any FLAC audio blocks.');
+      }
+      if (flacSegmentFiles.length === 1) {
+        const singleBytes = await ffmpeg.readFile(flacSegmentFiles[0]);
+        await ffmpeg.deleteFile(flacSegmentFiles[0]).catch(() => undefined);
+        if (!(singleBytes instanceof Uint8Array) || singleBytes.byteLength === 0) {
+          throw new Error('FFmpeg produced an empty FLAC stream.');
         }
+        outputBlobParts.push(singleBytes);
+        outputByteSize = singleBytes.byteLength;
+      } else {
+        flacListFile = `flist_${runId}.txt`;
+        virtualOutputName = `output_${runId}.flac`;
+        const concatManifest = flacSegmentFiles.map((f) => `file '${f}'`).join('\n');
+        await ffmpeg.writeFile(flacListFile, new TextEncoder().encode(concatManifest));
+
+        const concatExit = await ffmpeg.exec([
+          '-y',
+          '-f',
+          'concat',
+          '-safe',
+          '0',
+          '-i',
+          flacListFile,
+          '-c:a',
+          'flac',
+          '-ar',
+          String(TARGET_SAMPLE_RATE),
+          '-ac',
+          '6',
+          virtualOutputName,
+        ]);
+
+        for (const f of flacSegmentFiles) {
+          await ffmpeg.deleteFile(f).catch(() => undefined);
+        }
+        await ffmpeg.deleteFile(flacListFile).catch(() => undefined);
+
+        if (concatExit !== 0) {
+          throw new Error(`FFmpeg FLAC assembly failed (exit ${concatExit}).`);
+        }
+
+        const mergedFlac = await ffmpeg.readFile(virtualOutputName);
+        await ffmpeg.deleteFile(virtualOutputName).catch(() => undefined);
+        if (!(mergedFlac instanceof Uint8Array) || mergedFlac.byteLength === 0) {
+          throw new Error('FFmpeg produced an empty assembled FLAC file.');
+        }
+        outputBlobParts.push(mergedFlac);
+        outputByteSize = mergedFlac.byteLength;
       }
     }
+
+    const { channelRms } = await dspWorker.finish();
+    emitProgress(97);
+
+    const outputFilename = buildOutputFilename(sourceFilename, exportFormat, spatialContainer);
+    let finalBlobParts = outputBlobParts;
+    if (is8dMode && spatialContainer === 'wav') {
+      const header = buildStereoWavHeaderBytes(totalRawPcmBytes, TARGET_SAMPLE_RATE);
+      finalBlobParts = [header, ...outputBlobParts];
+      outputByteSize = header.byteLength + totalRawPcmBytes;
+    }
+
+    const blob = new Blob(finalBlobParts as unknown as BlobPart[], {
+      type: getMimeTypeForExport(exportFormat, spatialContainer),
+    });
+    const url = URL.createObjectURL(blob);
+
+    emitProgress(100);
+    onPhaseChange?.('completed');
+
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    pushStatus(
+      `Verified ${is8dMode ? '8D Spatial' : `5.1 ${exportFormat.toUpperCase()}`} output: ${outputFilename} (${outputByteSize.toLocaleString()} B in ${elapsedMs} ms)`,
+    );
+
+    return {
+      blob,
+      url,
+      outputFilename,
+      sizeBytes: outputByteSize,
+      format: exportFormat,
+      codecLabel: getCodecLabel(exportFormat, spatialContainer, bitrateKbps),
+      bitrateKbps:
+        exportFormat === 'ac3'
+          ? bitrateKbps
+          : exportFormat === 'dts'
+            ? 768
+            : is8dMode && spatialContainer === 'mp3'
+              ? 320
+              : undefined,
+      sampleRate: TARGET_SAMPLE_RATE,
+      channels: is8dMode ? 2 : 6,
+      elapsedMs,
+      usedCustomMix: true,
+      channelRms: is8dMode ? undefined : channelRms,
+      statusLogs,
+    };
   } catch (err) {
     if (isMemoryAllocationError(err)) {
       resetFfmpegWorker();
@@ -804,6 +697,27 @@ export async function convertAudioToAc3(options: ConvertOptions): Promise<Conver
     const friendlyMessage = formatFriendlyError(err, recentLogs);
     throw new Error(friendlyMessage);
   } finally {
+    dspWorker?.terminate();
+    detachFfmpegListeners(ffmpeg);
+    if (ffmpeg) {
+      if (mountDir) {
+        await ffmpeg.unmount(mountDir).catch(() => undefined);
+        await ffmpeg.deleteDir(mountDir).catch(() => undefined);
+      }
+      for (const fname of [
+        fallbackRawName,
+        chunkDecWav,
+        chunkSegIn,
+        chunkSegOut,
+        flacListFile,
+        virtualOutputName,
+        ...flacSegmentFiles,
+      ]) {
+        if (fname) {
+          await ffmpeg.deleteFile(fname).catch(() => undefined);
+        }
+      }
+    }
     conversionInFlight = false;
   }
 }

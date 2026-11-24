@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent, type DragEv
 import {
   AlertCircle,
   CheckCircle2,
-  Disc3,
   Download,
   FileAudio,
   Loader2,
@@ -34,7 +33,6 @@ import {
 } from '../utils/channelMath';
 import { convertAudioToAc3 } from '../utils/ffmpegConverter';
 import {
-  inspectAudioBufferMetadata,
   StageAudioPlayer,
   ZERO_LEVELS,
   type ChannelLevels,
@@ -105,9 +103,12 @@ export function ConverterStudio({
   const [upmixProfile, setUpmixProfile] = useState<UpmixProfile>('cinema-pro');
   const [bitrateKbps, setBitrateKbps] = useState<Ac3BitrateKbps>(448);
 
-  const [sourceBytes, setSourceBytes] = useState<Uint8Array | null>(null);
+  const [sourceFile, setSourceFile] = useState<File | Blob | null>(null);
   const [trackMeta, setTrackMeta] = useState<AudioTrackMetadata | null>(null);
-  const [energyProfile, setEnergyProfile] = useState<TrackEnergyFrame[]>([]);
+  const [isLoadingTrack, setIsLoadingTrack] = useState(false);
+  const [loadingStatusText, setLoadingStatusText] = useState('Initializing audio stream...');
+  const [emblemFailed, setEmblemFailed] = useState(false);
+  const [energyProfile] = useState<TrackEnergyFrame[]>([]);
   const [isDragging, setIsDragging] = useState(false);
 
   const [isPlaying, setIsPlaying] = useState(false);
@@ -149,6 +150,10 @@ export function ConverterStudio({
           setOrbitAngleDeg(deg);
         }
       },
+      (loading, text) => {
+        setIsLoadingTrack(loading);
+        if (text) setLoadingStatusText(text);
+      },
     );
     playerRef.current = player;
 
@@ -171,13 +176,15 @@ export function ConverterStudio({
     playerRef.current?.updateMixConfig(channels, upmixProfile, exportFormat, orbitPeriodSec);
   }, [channels, upmixProfile, exportFormat, orbitPeriodSec]);
 
-  const loadBytesIntoStudio = useCallback(
-    async (bytes: Uint8Array, name: string, mimeType: string, isDemo = false) => {
+  const loadSourceIntoStudio = useCallback(
+    async (fileOrBlob: File | Blob, name: string, mimeType: string, isDemo = false) => {
       try {
         setErrorMessage(null);
         setPhase('idle');
         setProgressPct(0);
         setConversionLogs([]);
+        setIsLoadingTrack(true);
+        setLoadingStatusText('Reading audio stream metadata...');
 
         if (resultUrlRef.current) {
           URL.revokeObjectURL(resultUrlRef.current);
@@ -185,10 +192,10 @@ export function ConverterStudio({
         }
         setConversionResult(null);
 
-        setSourceBytes(bytes);
+        setSourceFile(fileOrBlob);
         setTrackMeta({
           name,
-          sizeBytes: bytes.byteLength,
+          sizeBytes: fileOrBlob.size,
           mimeType,
           durationSec: 0,
           sampleRate: 48000,
@@ -196,24 +203,27 @@ export function ConverterStudio({
           isDemo,
         });
 
-        const inspected = await inspectAudioBufferMetadata(bytes);
-        setTrackMeta({
-          name,
-          sizeBytes: bytes.byteLength,
-          mimeType,
-          durationSec: inspected.durationSec,
-          sampleRate: inspected.sampleRate,
-          sourceChannels: inspected.sourceChannels,
-          isDemo,
-        });
-        setEnergyProfile(inspected.energyProfile);
-
-        playerRef.current?.setBuffer(inspected.audioBuffer);
+        const streamInfo = await playerRef.current?.loadAudioFile(fileOrBlob, name);
+        if (streamInfo) {
+          setTrackMeta({
+            name,
+            sizeBytes: fileOrBlob.size,
+            mimeType,
+            durationSec: streamInfo.durationSec,
+            sampleRate: streamInfo.sampleRate,
+            sourceChannels: streamInfo.sourceChannels,
+            isDemo,
+          });
+        }
       } catch (err) {
+        if (err instanceof Error && err.message === 'Track load superseded') return;
         console.error('[Surround X][Load Audio Error]', err);
+        setIsLoadingTrack(false);
         setErrorMessage(
-          err instanceof Error ? err.message : 'Unable to read the selected audio file.',
+          err instanceof Error ? err.message : 'Unable to initialize streaming playback for this audio file.',
         );
+      } finally {
+        setIsLoadingTrack(false);
       }
     },
     [],
@@ -221,8 +231,9 @@ export function ConverterStudio({
 
   const handleLoadDemoTrack = useCallback(async () => {
     const demoWav = createDemoStereoWavBuffer(8, 48000);
-    await loadBytesIntoStudio(demoWav, 'Forest_Theater_Demo_Stereo.wav', 'audio/wav', true);
-  }, [loadBytesIntoStudio]);
+    const demoBlob = new Blob([demoWav as unknown as BlobPart], { type: 'audio/wav' });
+    await loadSourceIntoStudio(demoBlob, 'Forest_Theater_Demo_Stereo.wav', 'audio/wav', true);
+  }, [loadSourceIntoStudio]);
 
   useEffect(() => {
     if (demoRequestKey > 0) {
@@ -243,28 +254,9 @@ export function ConverterStudio({
         setErrorMessage('The selected file is empty (0 bytes). Please choose a valid audio file.');
         return;
       }
-      if (file.size > 150 * 1024 * 1024) {
-        setErrorMessage(
-          'File size exceeds 150 MB. Mobile browsers have strict memory limits; please select an audio file under 100 MB to prevent allocation crashes.',
-        );
-        return;
-      }
-      try {
-        const arrayBuf = await file.arrayBuffer();
-        await loadBytesIntoStudio(
-          new Uint8Array(arrayBuf),
-          file.name,
-          file.type || 'audio/mpeg',
-          false,
-        );
-      } catch (err) {
-        console.error('[Surround X][File Read Error]', err);
-        setErrorMessage(
-          'Failed to read audio file into memory. The file may be too large for this mobile browser. Try an audio file under 100 MB.',
-        );
-      }
+      await loadSourceIntoStudio(file, file.name, file.type || 'audio/mpeg', false);
     },
-    [loadBytesIntoStudio],
+    [loadSourceIntoStudio],
   );
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
@@ -350,7 +342,7 @@ export function ConverterStudio({
   };
 
   const handleConvert = async () => {
-    if (!sourceBytes || !trackMeta) {
+    if (!sourceFile || !trackMeta) {
       setErrorMessage('Please upload an audio file or load the demo stereo track first.');
       return;
     }
@@ -366,8 +358,9 @@ export function ConverterStudio({
 
     try {
       const result = await convertAudioToAc3({
-        sourceBytes,
-        sourceAudioBuffer: playerRef.current?.getBuffer() ?? undefined,
+        sourceFile,
+        durationSec: trackMeta.durationSec,
+        sourceChannels: trackMeta.sourceChannels,
         sourceFilename: trackMeta.name,
         exportFormat,
         spatialContainer,
@@ -420,8 +413,18 @@ export function ConverterStudio({
             onClick={onReturnWelcome}
             className="flex items-center gap-2.5 text-left cursor-pointer whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-cyan-300 rounded-lg"
           >
-            <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg hardware-badge text-[#00F0FF]">
-              <Disc3 className="w-4 h-4" aria-hidden="true" />
+            <span className="inline-flex items-center justify-center w-8 h-8 rounded-lg hardware-badge overflow-hidden shrink-0">
+              {!emblemFailed ? (
+                <img
+                  src="/assets/aistudio/surround_x_emblem.png"
+                  alt=""
+                  referrerPolicy="no-referrer"
+                  onError={() => setEmblemFailed(true)}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <span className="font-display text-sm font-bold text-[#00F0FF]">X</span>
+              )}
             </span>
             <span className="font-display text-lg font-semibold tracking-tight text-white">
               Surround X
@@ -526,7 +529,7 @@ export function ConverterStudio({
                   Drop an audio file here, or browse local storage
                 </p>
                 <p className="text-[11px] text-slate-400 mb-3">
-                  Processed locally in WebAssembly · Up to 250 MB
+                  Instant streaming playback · Memory-safe 15 MB–250 MB+ WASM conversion
                 </p>
 
                 <div className="flex flex-wrap items-center justify-center gap-2">
@@ -580,14 +583,20 @@ export function ConverterStudio({
                     <button
                       type="button"
                       onClick={() => void handleTogglePlayback()}
+                      disabled={isLoadingTrack}
                       aria-label={isPlaying ? 'Pause stage audition' : 'Play stage audition'}
-                      className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer shrink-0 focus-visible:outline-2 focus-visible:outline-cyan-300 ${
+                      className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer shrink-0 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-cyan-300 ${
                         isPlaying
                           ? 'hardware-pill-active-cyan text-white'
                           : 'hardware-btn text-cyan-100 hover:text-white'
                       }`}
                     >
-                      {isPlaying ? (
+                      {isLoadingTrack ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 text-[#00F0FF] animate-spin" aria-hidden="true" />
+                          <span>Loading...</span>
+                        </>
+                      ) : isPlaying ? (
                         <>
                           <Pause className="w-3.5 h-3.5 text-[#00F0FF]" aria-hidden="true" />
                           <span>Pause</span>
@@ -600,6 +609,16 @@ export function ConverterStudio({
                       )}
                     </button>
                   </div>
+
+                  {isLoadingTrack && (
+                    <div
+                      className="flex items-center gap-2 rounded-lg bg-[#07090E]/85 border border-cyan-400/25 px-3 py-2 text-xs text-cyan-200"
+                      data-testid="track-metadata-loading"
+                    >
+                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0 text-[#00F0FF]" aria-hidden="true" />
+                      <span>{loadingStatusText}</span>
+                    </div>
+                  )}
 
                   {/* Interactive Playback Progress Scrubber */}
                   <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
@@ -823,7 +842,7 @@ export function ConverterStudio({
               <button
                 type="button"
                 onClick={() => void handleConvert()}
-                disabled={!sourceBytes || isConverting}
+                disabled={!sourceFile || isLoadingTrack || isConverting}
                 data-testid="convert-primary-btn"
                 className="hardware-cta-primary w-full py-3.5 px-5 rounded-xl font-semibold text-sm disabled:opacity-45 disabled:cursor-not-allowed active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer focus-visible:outline-2 focus-visible:outline-cyan-300"
               >

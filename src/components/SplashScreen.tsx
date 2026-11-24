@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { stepSmoothedWavePoints, WAVE_POINT_COUNT } from '../utils/waveMath';
 
-const HERO_THEATER_IMAGE = '/assets/aistudio/1794649766228_86899eeb.jpg';
+const FOREST_THEATER_IMAGE = '/assets/aistudio/1794649766228_86899eeb.jpg';
+const HEADER_EMBLEM = '/assets/aistudio/surround_x_emblem.png';
 
 const SPLASH_DISPLAY_MS = 6950;
 const FADE_DURATION_MS = 550;
@@ -22,7 +23,8 @@ interface SplashScreenProps {
 
 export function SplashScreen({ onComplete }: SplashScreenProps) {
   const [fadingOut, setFadingOut] = useState(false);
-  const [imageFailed, setImageFailed] = useState(false);
+  const [forestFailed, setForestFailed] = useState(false);
+  const [emblemFailed, setEmblemFailed] = useState(false);
   const [statusIndex, setStatusIndex] = useState(0);
 
   const canvasWrapRef = useRef<HTMLDivElement | null>(null);
@@ -142,7 +144,8 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
     resizeObserver?.observe(wrap);
 
     let rafId = 0;
-    let lastNow = performance.now();
+    const mountNow = performance.now();
+    let lastNow = mountNow;
     let lastPaint = 0;
 
     const drawWave = (now: number, force = false) => {
@@ -154,16 +157,16 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
       }
       lastPaint = now;
 
-      const dtSec = Math.min(0.05, Math.max(0.008, (now - lastNow) * 0.001));
+      const dtSec = Math.min(0.033, Math.max(0.006, (now - lastNow) * 0.001));
       lastNow = now;
-      const t = now * 0.001;
+      const t = Math.max(0, (now - mountNow) * 0.001);
 
       // Fluid calm-to-resonant loading energy pulse
-      const waveEnergy = reducedMotion ? 0.2 : 0.34 + 0.14 * Math.sin(t * 2.4);
+      const waveEnergy = reducedMotion ? 0.2 : 0.34 + 0.08 * Math.sin(t * 2.1);
 
       const nextPoints = stepSmoothedWavePoints(
         pointsRef.current,
-        reducedMotion ? 0.45 : t * 1.15,
+        reducedMotion ? 0.45 : t * 1.05,
         waveEnergy,
         dtSec,
         scratchRef.current,
@@ -253,21 +256,20 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
     >
       <h1 className="sr-only">Surround X — Stereo to 5.1 Dolby Digital Audio Studio</h1>
 
-      {/* Soft obsidian ambient backdrop derived from reference art */}
-      {!imageFailed && (
+      {/* Soft obsidian ambient forest stage backdrop */}
+      {!forestFailed && (
         <div className="absolute inset-0 pointer-events-none overflow-hidden" aria-hidden="true">
           <img
-            src={HERO_THEATER_IMAGE}
+            src={FOREST_THEATER_IMAGE}
             alt=""
             referrerPolicy="no-referrer"
-            onError={() => setImageFailed(true)}
-            className="w-full h-full object-cover object-center opacity-15 blur-xl scale-105 select-none"
+            className="w-full h-full object-cover object-center opacity-18 blur-2xl scale-110 select-none"
           />
           <div
             className="absolute inset-0"
             style={{
               background:
-                'radial-gradient(circle at 50% 44%, rgba(7, 9, 14, 0.45) 0%, rgba(7, 9, 14, 0.92) 68%, #07090E 100%)',
+                'radial-gradient(circle at 50% 44%, rgba(2, 12, 22, 0.35) 0%, rgba(7, 9, 14, 0.92) 68%, #07090E 100%)',
             }}
           />
         </div>
@@ -275,7 +277,20 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
 
       {/* Compact Top Bar */}
       <header className="relative z-20 w-full max-w-5xl mx-auto px-4 sm:px-8 pt-3 sm:pt-5 flex items-center justify-between gap-3 shrink-0">
-        <div className="flex items-center gap-2 text-xs font-medium tracking-wide text-slate-300 whitespace-nowrap">
+        <div className="flex items-center gap-2.5 text-xs font-medium tracking-wide text-slate-300 whitespace-nowrap">
+          <span className="inline-flex items-center justify-center w-7 h-7 rounded-lg hardware-badge overflow-hidden shrink-0">
+            {!emblemFailed ? (
+              <img
+                src={HEADER_EMBLEM}
+                alt=""
+                referrerPolicy="no-referrer"
+                onError={() => setEmblemFailed(true)}
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <span className="font-display text-xs font-bold text-[#00F0FF]">X</span>
+            )}
+          </span>
           <span className="font-display font-bold tracking-wider text-[#00F0FF]">
             SURROUND X
           </span>
@@ -294,17 +309,18 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
         </button>
       </header>
 
-      {/* Centered Obsidian Theater Visual + Smooth Glowing Wave Line */}
-      <div className="relative z-10 flex-1 min-h-0 w-full max-w-xl mx-auto px-4 sm:px-6 py-2 flex flex-col items-center justify-center gap-3.5 sm:gap-4">
-        <div className="relative w-full max-w-[min(100%,calc(44dvh*4/3))] rounded-2xl overflow-hidden bg-[#07090E]/90 border border-cyan-400/20 shadow-[0_24px_60px_-16px_rgba(0,0,0,0.95),0_0_36px_-14px_rgba(0,240,255,0.22)]">
-          {!imageFailed ? (
-            <div className="relative w-full aspect-[4/3] flex items-center justify-center bg-[#07090E]">
+      {/* Centered Forest Surround Stage Visual + Smooth Glowing Wave Line */}
+      <div className="relative z-10 flex-1 min-h-0 w-full max-w-xl mx-auto px-4 sm:px-6 py-2 flex flex-col items-center justify-center gap-4 sm:gap-5">
+        {/* Forest 5.1 Home Theater Surround Sound Scene */}
+        <div className="relative w-full max-w-[min(92vw,520px)] max-h-[44dvh] aspect-[4/3] mx-auto rounded-2xl overflow-hidden bg-[#020C16] border border-cyan-400/25 shadow-[0_24px_60px_-16px_rgba(0,0,0,0.95),0_0_36px_-14px_rgba(56,189,248,0.24)]">
+          {!forestFailed ? (
+            <div className="relative w-full h-full bg-[#020C16]">
               <img
-                src={HERO_THEATER_IMAGE}
-                alt="Surround X 5.1 home theater speakers with glowing cyan acoustic rings"
+                src={FOREST_THEATER_IMAGE}
+                alt="Surround X 5.1 Forest Home Theater Spatial Stage"
                 referrerPolicy="no-referrer"
-                onError={() => setImageFailed(true)}
-                data-testid="splash-hero-image"
+                onError={() => setForestFailed(true)}
+                data-testid="splash-forest-image"
                 className="w-full h-full object-cover object-center select-none pointer-events-none block"
               />
               <div
@@ -312,12 +328,12 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
                 className="absolute inset-0 pointer-events-none"
                 style={{
                   background:
-                    'linear-gradient(180deg, rgba(7, 9, 14, 0.2) 0%, transparent 22%, transparent 76%, rgba(7, 9, 14, 0.62) 100%)',
+                    'radial-gradient(circle at 50% 48%, transparent 54%, rgba(2, 12, 22, 0.42) 100%)',
                 }}
               />
             </div>
           ) : (
-            <div className="px-6 py-12 text-center bg-gradient-to-b from-[#0D111A] to-[#07090E]">
+            <div className="w-full h-full px-6 py-12 flex flex-col items-center justify-center text-center bg-gradient-to-b from-[#0D111A] to-[#07090E]">
               <p className="font-display text-3xl sm:text-4xl font-bold tracking-[0.18em] text-white">
                 SURROUND <span className="text-[#00F0FF]">X</span>
               </p>
@@ -331,7 +347,7 @@ export function SplashScreen({ onComplete }: SplashScreenProps) {
         {/* Smooth Glowing Wave Line Module */}
         <section
           aria-label="Loading Surround X studio"
-          className="w-full rounded-2xl bg-[#07090E]/92 backdrop-blur-md border border-cyan-400/20 px-4 pt-3 pb-3.5 shadow-[inset_0_1px_0_rgba(226,232,240,0.08),0_18px_42px_-16px_rgba(0,0,0,0.92)]"
+          className="w-full max-w-[min(92vw,520px)] mx-auto rounded-2xl bg-[#07090E]/92 backdrop-blur-md border border-cyan-400/20 px-4 pt-3 pb-3.5 shadow-[inset_0_1px_0_rgba(226,232,240,0.08),0_18px_42px_-16px_rgba(0,0,0,0.92)]"
         >
           <div
             ref={canvasWrapRef}

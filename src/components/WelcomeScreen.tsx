@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { ArrowRight, Disc3, Play, Sliders, Speaker, Cpu } from 'lucide-react';
+import { ArrowRight, Play, Sliders, Speaker, Cpu } from 'lucide-react';
 
 const FINAL_THEATER_IMAGE = '/assets/aistudio/1794649766228_86899eeb.jpg';
+const HEADER_EMBLEM = '/assets/aistudio/surround_x_emblem.png';
 
 interface WelcomeScreenProps {
   onEnterStudio: () => void;
@@ -29,6 +30,7 @@ const CAPABILITIES = [
 export function WelcomeScreen({ onEnterStudio, onLaunchWithDemo }: WelcomeScreenProps) {
   const [exiting, setExiting] = useState(false);
   const [imageFailed, setImageFailed] = useState(false);
+  const [emblemFailed, setEmblemFailed] = useState(false);
 
   const handleAction = (callback: () => void) => {
     if (exiting) return;
@@ -81,8 +83,18 @@ export function WelcomeScreen({ onEnterStudio, onLaunchWithDemo }: WelcomeScreen
       {/* Top Minimal Brand Header */}
       <header className="relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-8 pt-5 sm:pt-7 flex items-center justify-between gap-4">
         <div className="flex items-center gap-2.5 whitespace-nowrap shrink-0">
-          <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl hardware-badge text-[#00F0FF]">
-            <Disc3 className="w-4.5 h-4.5" aria-hidden="true" />
+          <span className="inline-flex items-center justify-center w-9 h-9 rounded-xl hardware-badge overflow-hidden shrink-0">
+            {!emblemFailed ? (
+              <img
+                src={HEADER_EMBLEM}
+                alt=""
+                referrerPolicy="no-referrer"
+                onError={() => setEmblemFailed(true)}
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <span className="font-display text-base font-bold text-[#00F0FF]">X</span>
+            )}
           </span>
           <span className="font-display text-lg sm:text-xl font-bold tracking-tight text-white">
             Surround X

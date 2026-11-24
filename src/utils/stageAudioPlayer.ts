@@ -1,17 +1,18 @@
 import type { ChannelConfig, ChannelId, ExportFormat, UpmixProfile } from './audioTypes';
+import { parseAudioHeaderBytes } from './audioHeader';
 import {
   computeBassBeatIntensity,
   computeEffectiveChannelGains,
-  extractTrackEnergyProfile,
   get8dAzimuthDegrees,
   wrapAzimuth180,
   wrapAzimuth360,
-  type TrackEnergyFrame,
 } from './channelMath';
+import { extractLogFrequencyBands, STUDIO_BAND_COUNT } from './waveMath';
 
 export type ChannelLevels = Record<ChannelId, number> & {
   lfeBeat: number;
   orbitAngleDeg?: number;
+  spectrum?: Float32Array;
 };
 
 export const ZERO_LEVELS: ChannelLevels = {
@@ -24,57 +25,10 @@ export const ZERO_LEVELS: ChannelLevels = {
   lfeBeat: 0,
 };
 
-export async function inspectAudioBufferMetadata(bytes: Uint8Array): Promise<{
+export interface LoadedTrackStreamInfo {
   durationSec: number;
   sampleRate: number;
   sourceChannels: number;
-  audioBuffer: AudioBuffer | null;
-  energyProfile: TrackEnergyFrame[];
-}> {
-  const OfflineCtx =
-    window.OfflineAudioContext ||
-    (window as unknown as { webkitOfflineAudioContext: typeof OfflineAudioContext })
-      .webkitOfflineAudioContext;
-
-  if (!OfflineCtx || bytes.byteLength > 75 * 1024 * 1024) {
-    console.info('[Surround X][Audio Inspect] Skipping full browser preview decode due to file size or memory constraint.');
-    return {
-      durationSec: 180,
-      sampleRate: 48000,
-      sourceChannels: 2,
-      audioBuffer: null,
-      energyProfile: [],
-    };
-  }
-
-  try {
-    const ctx = new OfflineCtx(2, 1, 48000);
-    const audioDataBuffer = bytes.buffer.slice(
-      bytes.byteOffset,
-      bytes.byteOffset + bytes.byteLength,
-    ) as ArrayBuffer;
-    const decoded = await ctx.decodeAudioData(audioDataBuffer);
-    const left = decoded.getChannelData(0);
-    const right = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : left;
-    const energyProfile = extractTrackEnergyProfile(left, right, 48);
-
-    return {
-      durationSec: decoded.duration,
-      sampleRate: decoded.sampleRate,
-      sourceChannels: decoded.numberOfChannels,
-      audioBuffer: decoded,
-      energyProfile,
-    };
-  } catch (err) {
-    console.warn('[Surround X][Audio Inspect] Browser preview decode skipped or memory limit reached:', err);
-    return {
-      durationSec: 0,
-      sampleRate: 48000,
-      sourceChannels: 2,
-      audioBuffer: null,
-      energyProfile: [],
-    };
-  }
 }
 
 interface BusNodes {
@@ -88,7 +42,16 @@ interface BusNodes {
 
 export class StageAudioPlayer {
   private ctx: AudioContext | null = null;
-  private sourceNode: AudioBufferSourceNode | null = null;
+  private audioEl: HTMLAudioElement | null = null;
+  private mediaSource: MediaElementAudioSourceNode | null = null;
+  private objectUrl: string | null = null;
+  private loadNonce = 0;
+
+  private trackDurationSec = 0;
+  private trackSampleRate = 48000;
+  private trackChannels = 2;
+  private hasLoadedTrack = false;
+
   private busGains: BusNodes | null = null;
   private leftAnalyser: AnalyserNode | null = null;
   private rightAnalyser: AnalyserNode | null = null;
@@ -96,23 +59,26 @@ export class StageAudioPlayer {
   private centerAnalyser: AnalyserNode | null = null;
   private slAnalyser: AnalyserNode | null = null;
   private srAnalyser: AnalyserNode | null = null;
+  private spectrumAnalyser: AnalyserNode | null = null;
+
   // Real-time Web Audio 8D Binaural rotation nodes
   private binauralPanNode: StereoPannerNode | null = null;
   private binauralPinnaFilter: BiquadFilterNode | null = null;
   private binauralDelayL: DelayNode | null = null;
   private binauralDelayR: DelayNode | null = null;
-  // Active graph tracking for clean mobile GC & anti-click shutdown
+
+  // Active downstream graph tracking for seamless format switches & clean shutdown
   private activeMasterSum: GainNode | null = null;
   private activeCleanupNodes: AudioNode[] = [];
+  private graphBuiltForFormat: ExportFormat | null = null;
+  private graphBuiltForChannels = 0;
+
   private rafId: number | null = null;
-  private buffer: AudioBuffer | null = null;
-  private startOffset = 0;
-  private startedAt = 0;
   private isPlaying = false;
-  private playbackEnded = false;
   private bassMovingAvg = 0;
   private bassBeatState = 0;
-  // Reusable analyser buffers cleared to zero/silence whenever playback stops or ends
+
+  // Reusable analyser buffers cleared to silence whenever playback stops or pauses
   private readonly bufL = new Uint8Array(new ArrayBuffer(512));
   private readonly bufR = new Uint8Array(new ArrayBuffer(512));
   private readonly bufCenter = new Uint8Array(new ArrayBuffer(512));
@@ -120,27 +86,196 @@ export class StageAudioPlayer {
   private readonly bufSR = new Uint8Array(new ArrayBuffer(512));
   private readonly bufLowTime = new Uint8Array(new ArrayBuffer(2048));
   private readonly bufLowFreq = new Uint8Array(new ArrayBuffer(1024));
+  private readonly bufSpectrumFreq = new Uint8Array(new ArrayBuffer(1024));
+  private readonly spectrumBands = new Float32Array(STUDIO_BAND_COUNT);
+
   private channels: ChannelConfig[] = [];
   private upmixProfile: UpmixProfile = 'cinema-pro';
   private exportFormat: ExportFormat = 'ac3';
   private orbitPeriodSec = 8.0;
   private orbitPhaseBase = 0;
   private orbitPhaseRefTime = 0;
+
   private onLevelsCallback?: (levels: ChannelLevels) => void;
   private onTimeCallback?: (currentSec: number, playing: boolean) => void;
   private onOrbitAngleCallback?: (angleDeg: number) => void;
+  private onLoadStateCallback?: (loading: boolean, statusText?: string) => void;
 
-  setBuffer(buffer: AudioBuffer | null) {
-    this.stop();
-    this.buffer = buffer;
-    this.startOffset = 0;
-    this.playbackEnded = false;
-    this.clearAnalyserData();
-    this.onTimeCallback?.(0, false);
+  private ensureContext(): AudioContext {
+    if (!this.ctx || this.ctx.state === 'closed') {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new AudioCtx();
+    }
+    return this.ctx;
   }
 
-  getBuffer(): AudioBuffer | null {
-    return this.buffer;
+  private ensureMediaElement(): HTMLAudioElement {
+    if (!this.audioEl) {
+      const el = document.createElement('audio');
+      el.preload = 'metadata';
+      el.crossOrigin = 'anonymous';
+      el.setAttribute('playsinline', '');
+      el.addEventListener('ended', () => {
+        if (this.audioEl === el) {
+          this.isPlaying = false;
+          this.cancelMeterLoop();
+          this.clearAnalyserData();
+          try {
+            el.currentTime = 0;
+          } catch {
+            // Ignore seek reset errors
+          }
+          this.onTimeCallback?.(0, false);
+        }
+      });
+      this.audioEl = el;
+    }
+    return this.audioEl;
+  }
+
+  private ensureMediaSource(ctx: AudioContext): MediaElementAudioSourceNode {
+    const el = this.ensureMediaElement();
+    if (!this.mediaSource) {
+      this.mediaSource = ctx.createMediaElementSource(el);
+    }
+    return this.mediaSource;
+  }
+
+  private revokeCurrentUrl() {
+    if (this.objectUrl) {
+      URL.revokeObjectURL(this.objectUrl);
+      this.objectUrl = null;
+    }
+  }
+
+  /**
+   * Instantly attaches a File or Blob for streaming HTMLAudioElement playback with zero
+   * full-file AudioContext.decodeAudioData buffering, reading only <= 64 KB for header specs.
+   */
+  async loadAudioFile(
+    source: File | Blob,
+    filenameHint = 'audio',
+  ): Promise<LoadedTrackStreamInfo> {
+    const nonce = ++this.loadNonce;
+    this.stop();
+    this.hasLoadedTrack = false;
+    this.onLoadStateCallback?.(true, 'Initializing streaming audio pipeline...');
+
+    // Read only the first 64 KB slice for container sample-rate/channel inspection
+    let headerInfo = { sampleRate: 48000, sourceChannels: 2, durationSec: null as number | null };
+    try {
+      const sliceLen = Math.min(source.size, 65536);
+      if (sliceLen > 0) {
+        const headerBuf = await source.slice(0, sliceLen).arrayBuffer();
+        if (nonce !== this.loadNonce) {
+          throw new Error('Track load superseded');
+        }
+        headerInfo = parseAudioHeaderBytes(
+          new Uint8Array(headerBuf),
+          filenameHint,
+          source.size,
+        );
+      }
+    } catch (err) {
+      if (nonce !== this.loadNonce) throw err;
+      // Fallback safely to metadata element below
+    }
+
+    const el = this.ensureMediaElement();
+    el.pause();
+    this.revokeCurrentUrl();
+
+    const nextUrl = URL.createObjectURL(source);
+    this.objectUrl = nextUrl;
+
+    const metaDuration = await new Promise<number>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        el.removeEventListener('loadedmetadata', onMeta);
+        el.removeEventListener('canplay', onCanPlay);
+        el.removeEventListener('error', onErr);
+        window.clearTimeout(timer);
+      };
+
+      const finishWithDuration = (dur: number) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(dur);
+      };
+
+      const onMeta = () => {
+        if (Number.isFinite(el.duration) && el.duration > 0) {
+          finishWithDuration(el.duration);
+        }
+      };
+
+      const onCanPlay = () => {
+        if (Number.isFinite(el.duration) && el.duration > 0) {
+          finishWithDuration(el.duration);
+        } else {
+          finishWithDuration(headerInfo.durationSec ?? 0);
+        }
+      };
+
+      const onErr = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (headerInfo.durationSec && headerInfo.durationSec > 0) {
+          resolve(headerInfo.durationSec);
+        } else {
+          reject(new Error('Browser audio decoder could not stream this container.'));
+        }
+      };
+
+      const timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        const dur =
+          Number.isFinite(el.duration) && el.duration > 0
+            ? el.duration
+            : (headerInfo.durationSec ?? 0);
+        resolve(dur);
+      }, 6000);
+
+      el.addEventListener('loadedmetadata', onMeta);
+      el.addEventListener('canplay', onCanPlay);
+      el.addEventListener('error', onErr);
+
+      el.src = nextUrl;
+      el.load();
+    });
+
+    if (nonce !== this.loadNonce) {
+      throw new Error('Track load superseded');
+    }
+
+    const resolvedDuration =
+      Number.isFinite(metaDuration) && metaDuration > 0
+        ? metaDuration
+        : (headerInfo.durationSec ?? 0);
+
+    this.trackDurationSec = resolvedDuration;
+    this.trackSampleRate = headerInfo.sampleRate || 48000;
+    this.trackChannels = Math.max(1, headerInfo.sourceChannels || 2);
+    this.hasLoadedTrack = true;
+
+    this.onLoadStateCallback?.(false);
+    this.onTimeCallback?.(0, false);
+
+    return {
+      durationSec: this.trackDurationSec,
+      sampleRate: this.trackSampleRate,
+      sourceChannels: this.trackChannels,
+    };
+  }
+
+  getTrackDurationSec(): number {
+    return this.trackDurationSec;
   }
 
   private applyBusGains(ctx: AudioContext, busGains: BusNodes) {
@@ -186,10 +321,9 @@ export class StageAudioPlayer {
       this.applyBusGains(this.ctx, this.busGains);
     }
 
-    // Seamlessly rebuild Web Audio graph if user toggles between 5.1 Surround and 8D Spatial mid-playback
-    if (formatChanged && this.isPlaying) {
-      const currentPos = this.ctx ? Math.max(0, this.ctx.currentTime - this.startedAt) : 0;
-      void this.seek(currentPos);
+    // Seamlessly rebuild downstream spatial graph if toggling 5.1 <-> 8D mid-stream without interrupting audioEl
+    if (formatChanged && this.ctx && this.mediaSource && this.activeMasterSum) {
+      this.rebuildSpatialGraph(this.ctx);
     }
   }
 
@@ -197,24 +331,16 @@ export class StageAudioPlayer {
     onLevels: (levels: ChannelLevels) => void,
     onTime: (currentSec: number, playing: boolean) => void,
     onOrbitAngle?: (angleDeg: number) => void,
+    onLoadState?: (loading: boolean, statusText?: string) => void,
   ) {
     this.onLevelsCallback = onLevels;
     this.onTimeCallback = onTime;
     this.onOrbitAngleCallback = onOrbitAngle;
-  }
-
-  private ensureContext(): AudioContext {
-    if (!this.ctx || this.ctx.state === 'closed') {
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtx();
-    }
-    return this.ctx;
+    this.onLoadStateCallback = onLoadState;
   }
 
   async togglePlay(): Promise<boolean> {
-    if (!this.buffer) return false;
+    if (!this.hasLoadedTrack) return false;
     if (this.isPlaying) {
       this.pause();
       return false;
@@ -224,37 +350,74 @@ export class StageAudioPlayer {
   }
 
   async seek(targetSec: number) {
-    if (!this.buffer) return;
-    const clamped = Math.max(0, Math.min(this.buffer.duration, targetSec));
-    const wasPlaying = this.isPlaying;
-    if (wasPlaying) {
-      this.stopSourceOnly();
-      this.isPlaying = false;
-      this.cancelMeterLoop();
-    } else {
+    if (!this.hasLoadedTrack || !this.audioEl) return;
+    const maxDur =
+      Number.isFinite(this.audioEl.duration) && this.audioEl.duration > 0
+        ? this.audioEl.duration
+        : this.trackDurationSec;
+    const clamped = Math.max(0, maxDur > 0 ? Math.min(maxDur, targetSec) : targetSec);
+    try {
+      this.audioEl.currentTime = clamped;
+    } catch {
+      // Ignore seek before metadata settles
+    }
+    if (!this.isPlaying) {
       this.clearAnalyserData();
+    } else if (this.ctx) {
+      this.orbitPhaseBase = (((clamped / this.orbitPeriodSec) % 1) + 1) % 1;
+      this.orbitPhaseRefTime = this.ctx.currentTime;
     }
-    this.startOffset = clamped;
-    this.onTimeCallback?.(clamped, wasPlaying);
-    if (wasPlaying) {
-      await this.play();
-    }
+    this.onTimeCallback?.(clamped, this.isPlaying);
   }
 
-  async play() {
-    if (!this.buffer || this.isPlaying) return;
-    const ctx = this.ensureContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
+  private tearDownSpatialGraph() {
+    if (this.mediaSource) {
+      try {
+        this.mediaSource.disconnect();
+      } catch {
+        // Ignore if not connected
+      }
     }
+    if (this.activeMasterSum) {
+      try {
+        this.activeMasterSum.disconnect();
+      } catch {
+        // Ignore disconnect errors
+      }
+      this.activeMasterSum = null;
+    }
+    for (const node of this.activeCleanupNodes) {
+      try {
+        node.disconnect();
+      } catch {
+        // Ignore already disconnected node
+      }
+    }
+    this.activeCleanupNodes = [];
+    this.busGains = null;
+    this.leftAnalyser = null;
+    this.rightAnalyser = null;
+    this.lowAnalyser = null;
+    this.centerAnalyser = null;
+    this.slAnalyser = null;
+    this.srAnalyser = null;
+    this.spectrumAnalyser = null;
+    this.binauralPanNode = null;
+    this.binauralPinnaFilter = null;
+    this.binauralDelayL = null;
+    this.binauralDelayR = null;
+    this.graphBuiltForFormat = null;
+    this.graphBuiltForChannels = 0;
+  }
 
-    const source = ctx.createBufferSource();
-    source.buffer = this.buffer;
+  private rebuildSpatialGraph(ctx: AudioContext) {
+    this.tearDownSpatialGraph();
 
-    const chCount = this.buffer.numberOfChannels;
-    const splitter = ctx.createChannelSplitter(Math.max(2, chCount));
+    const sourceNode = this.ensureMediaSource(ctx);
+    const chCount = Math.max(2, this.trackChannels);
+    const splitter = ctx.createChannelSplitter(chCount);
 
-    // Inline per-channel AnalyserNodes wired directly in the live playback path
+    // Inline per-channel AnalyserNodes wired directly in the live stream path
     const leftAnalyser = ctx.createAnalyser();
     const rightAnalyser = ctx.createAnalyser();
     const lowAnalyser = ctx.createAnalyser();
@@ -268,7 +431,6 @@ export class StageAudioPlayer {
     slAnalyser.fftSize = 512;
     srAnalyser.fftSize = 512;
 
-    // 2048-pt FFT at 48 kHz = 23.4 Hz/bin -> resolves 20-125 Hz sub-bass drops with full 0 dBFS headroom
     lowAnalyser.fftSize = 2048;
     lowAnalyser.minDecibels = -80;
     lowAnalyser.maxDecibels = -2;
@@ -280,7 +442,7 @@ export class StageAudioPlayer {
     srAnalyser.smoothingTimeConstant = 0.62;
     lowAnalyser.smoothingTimeConstant = 0.36;
 
-    // Sub-bass LFE crossover: sharp 4th-order 110 Hz Linkwitz-Riley low-pass filter (80-120 Hz sub-bass)
+    // Sub-bass LFE crossover: 4th-order 110 Hz Linkwitz-Riley LPF
     const lfeFilter1 = ctx.createBiquadFilter();
     lfeFilter1.type = 'lowpass';
     lfeFilter1.frequency.value = 110;
@@ -291,11 +453,9 @@ export class StageAudioPlayer {
     lfeFilter2.frequency.value = 110;
     lfeFilter2.Q.value = Math.SQRT1_2;
 
-    // True mono sum (L + R) * 0.5 feeding LFE sub-bass crossover
     const monoSum = ctx.createGain();
     monoSum.gain.value = 0.5;
 
-    // Surround ambient band-limiting (110 Hz HPF removes dry kick/bass, 13.5 kHz LPF keeps warm spatial air)
     const slDelay = ctx.createDelay(0.15);
     slDelay.delayTime.value = 0.014;
     const srDelay = ctx.createDelay(0.15);
@@ -315,7 +475,6 @@ export class StageAudioPlayer {
     srLp.type = 'lowpass';
     srLp.frequency.value = 13500;
 
-    // Discrete 6-bus spatial routing with real per-channel Mute/Solo/Gain
     const busGains: BusNodes = {
       FL: ctx.createGain(),
       FR: ctx.createGain(),
@@ -339,7 +498,6 @@ export class StageAudioPlayer {
     const panSR = ctx.createStereoPanner();
     panSR.pan.value = 0.95;
 
-    // Safely inspect hardware destination channel capacity (e.g. 2ch mobile vs 6ch 5.1 AVR)
     const maxDestCh = ctx.destination.maxChannelCount || 2;
     const useDiscreteSixOut = maxDestCh >= 6;
     try {
@@ -353,7 +511,7 @@ export class StageAudioPlayer {
         ctx.destination.channelInterpretation = 'speakers';
       }
     } catch {
-      // Fallback gracefully on browsers with read-only destination channelCount (e.g. mobile iOS Safari)
+      // Safe fallback on mobile browsers
     }
 
     const masterSum = ctx.createGain();
@@ -362,24 +520,28 @@ export class StageAudioPlayer {
       masterSum.channelCountMode = 'explicit';
       masterSum.channelInterpretation = useDiscreteSixOut ? 'discrete' : 'speakers';
     } catch {
-      // Ignore if browser clamps channel properties
+      // Safe fallback
     }
     const nowStart = ctx.currentTime;
     masterSum.gain.setValueAtTime(0.0001, nowStart);
     masterSum.gain.linearRampToValueAtTime(0.85, nowStart + 0.02);
     masterSum.connect(ctx.destination);
 
-    source.connect(splitter);
-    const leftIdx = 0;
-    const rightIdx = chCount > 1 ? 1 : 0;
+    // Full-band logarithmic visualizer tap connected directly to live media stream
+    const spectrumAnalyser = ctx.createAnalyser();
+    spectrumAnalyser.fftSize = 2048;
+    spectrumAnalyser.minDecibels = -84;
+    spectrumAnalyser.maxDecibels = -6;
+    spectrumAnalyser.smoothingTimeConstant = 0.78;
 
-    this.binauralPanNode = null;
-    this.binauralPinnaFilter = null;
-    this.binauralDelayL = null;
-    this.binauralDelayR = null;
+    sourceNode.connect(splitter);
+    sourceNode.connect(spectrumAnalyser);
+    const leftIdx = 0;
+    const rightIdx = this.trackChannels > 1 ? 1 : 0;
+
     const cleanupNodes: AudioNode[] = [
-      source,
       splitter,
+      spectrumAnalyser,
       masterSum,
       monoSum,
       lfeFilter1,
@@ -406,7 +568,6 @@ export class StageAudioPlayer {
 
     const routeBusOutputs = () => {
       if (useDiscreteSixOut) {
-        // Discrete 6-channel hardware mapping: [0: FL, 1: FR, 2: C, 3: LFE, 4: SL, 5: SR]
         const sixMerger = ctx.createChannelMerger(6);
         try {
           sixMerger.channelCount = 6;
@@ -424,7 +585,6 @@ export class StageAudioPlayer {
         sixMerger.connect(masterSum);
         cleanupNodes.push(sixMerger);
       } else {
-        // Stereo-safe downmix for mobile/desktop 2ch outputs without channel overflow or clicking
         const stereoMerger = ctx.createChannelMerger(2);
         try {
           stereoMerger.channelCount = 2;
@@ -457,7 +617,6 @@ export class StageAudioPlayer {
     };
 
     if (this.exportFormat === '8d-spatial') {
-      // ==================== LIVE WEB AUDIO 8D BINAURAL SPATIAL GRAPH ====================
       const orbitSum = ctx.createGain();
       orbitSum.gain.value = 0.72;
 
@@ -471,13 +630,11 @@ export class StageAudioPlayer {
 
       const binauralSplit = ctx.createChannelSplitter(2);
       const binauralMerge = ctx.createChannelMerger(2);
-      // 1ms safe baseline delay prevents mobile WebKit/Chromium DelayNode 0ms interpolation clicks
       const itdL = ctx.createDelay(0.02);
       itdL.delayTime.value = 0.001;
       const itdR = ctx.createDelay(0.02);
       itdR.delayTime.value = 0.001;
 
-      // Subtle concert hall early reflection bus
       const hallDelayL = ctx.createDelay(0.1);
       hallDelayL.delayTime.value = 0.023;
       const hallDelayR = ctx.createDelay(0.1);
@@ -488,14 +645,12 @@ export class StageAudioPlayer {
       const hallGain = ctx.createGain();
       hallGain.gain.value = 0.24;
 
-      // Grounded sub-bass anchor (<115 Hz) wired through lowAnalyser
       splitter.connect(monoSum, leftIdx);
       splitter.connect(monoSum, rightIdx);
       monoSum.connect(lfeFilter1);
       lfeFilter1.connect(lfeFilter2);
       lfeFilter2.connect(lowAnalyser);
 
-      // Main 8D orbital chain
       splitter.connect(leftAnalyser, leftIdx);
       splitter.connect(rightAnalyser, rightIdx);
       leftAnalyser.connect(orbitSum);
@@ -510,13 +665,11 @@ export class StageAudioPlayer {
       itdL.connect(binauralMerge, 0, 0);
       itdR.connect(binauralMerge, 0, 1);
 
-      // Analyzers for visual surround sweep cues
       itdL.connect(slAnalyser);
       itdR.connect(srAnalyser);
       pinnaFilter.connect(centerAnalyser);
 
       if (useDiscreteSixOut) {
-        // Route 8D orbit directly into all 6 physical speaker buses (FL, FR, C, LFE, SL, SR)
         pinnaFilter.connect(busGains.FL);
         pinnaFilter.connect(busGains.FR);
         pinnaFilter.connect(busGains.C);
@@ -531,7 +684,6 @@ export class StageAudioPlayer {
         subGain.connect(masterSum);
         binauralMerge.connect(masterSum);
 
-        // Diffuse room reflections
         pinnaFilter.connect(hallDamp);
         hallDamp.connect(hallDelayL);
         hallDamp.connect(hallDelayR);
@@ -558,8 +710,7 @@ export class StageAudioPlayer {
         hallDamp,
         hallGain,
       );
-    } else if (chCount >= 6) {
-      // Discrete 5.1 source routing through inline per-channel analyzers
+    } else if (this.trackChannels >= 6) {
       splitter.connect(leftAnalyser, 0);
       leftAnalyser.connect(busGains.FL);
 
@@ -581,10 +732,6 @@ export class StageAudioPlayer {
 
       routeBusOutputs();
     } else {
-      // Phase-Matched 3-Band LR4 (150 Hz & 6.5 kHz) Matrix Routing for Stereo Source:
-      // - Center (C): Strictly isolates centered 150 Hz - 6.5 kHz primary lead vocals
-      // - Front L/R (FL/FR): Preserves 100% of <150 Hz beats/kick, >6.5 kHz air/echoes, and stereo instruments/reverb
-      //   while canceling ~92% of centered vocals so lead vocals never muddy or overpower Front L/R
       const createLR4Pair = (
         type: BiquadFilterType,
         frequency: number,
@@ -622,7 +769,6 @@ export class StageAudioPlayer {
       rAbove.output.connect(rVocal.input);
       rAbove.output.connect(rAir.input);
 
-      // 1. Center Channel (C): 0.5 * (L_vocal + R_vocal) -> pure lead vocals (150 Hz - 6.5 kHz)
       const vocalMonoSum = ctx.createGain();
       vocalMonoSum.gain.value = 0.5;
       lVocal.output.connect(vocalMonoSum);
@@ -630,8 +776,6 @@ export class StageAudioPlayer {
       vocalMonoSum.connect(centerAnalyser);
       centerAnalyser.connect(busGains.C);
 
-      // 2. Front Towers (FL/FR): Phase-coherent vocal cancellation (-0.92 * vocalMonoSum) inside 150 Hz-6.5 kHz,
-      //    leaving 100% of <150 Hz beats, >6.5 kHz cymbals/echoes, and stereo instruments/reverb intact
       const vocalCancelGain = ctx.createGain();
       vocalCancelGain.gain.value = -0.92;
       vocalMonoSum.connect(vocalCancelGain);
@@ -654,7 +798,6 @@ export class StageAudioPlayer {
       frontRSum.connect(rightAnalyser);
       rightAnalyser.connect(busGains.FR);
 
-      // 3. Subwoofer (LFE): monoSum -> 4th-order 120 Hz LPF -> lowAnalyser -> busGains.LFE
       splitter.connect(monoSum, leftIdx);
       splitter.connect(monoSum, rightIdx);
       monoSum.connect(lfeFilter1);
@@ -662,10 +805,6 @@ export class StageAudioPlayer {
       lfeFilter2.connect(lowAnalyser);
       lowAnalyser.connect(busGains.LFE);
 
-      // 4. Pure Ambient & Reverb Rear Surrounds (SL/SR):
-      //    Strict stereo difference decoding S = (L - R) cancels centered dry vocals & mono beats 100%,
-      //    never duplicating Front L/R directly. Processed through decorrelated All-Pass diffusers,
-      //    Haas precedence delays (14ms/22ms), and damped multi-tap hall reverb/echoes (36ms/62ms SL, 44ms/74ms SR).
       const rightInverter = ctx.createGain();
       rightInverter.gain.value = -1.0;
       splitter.connect(rightInverter, rightIdx);
@@ -721,7 +860,6 @@ export class StageAudioPlayer {
       const srEchoGain2 = ctx.createGain();
       srEchoGain2.gain.value = 0.22;
 
-      // SL chain: +S -> 110Hz HPF -> 13.5kHz LPF -> AllPass -> (14ms Haas + 36ms/62ms warm echo) -> slAnalyser -> busGains.SL
       sideDiffSum.connect(slHp);
       slHp.connect(slLp);
       slLp.connect(slAllPass);
@@ -739,7 +877,6 @@ export class StageAudioPlayer {
       slEchoGain2.connect(slAnalyser);
       slAnalyser.connect(busGains.SL);
 
-      // SR chain: -S -> 110Hz HPF -> 13.5kHz LPF -> AllPass -> (22ms Haas + 44ms/74ms warm echo) -> srAnalyser -> busGains.SR
       srInverter.connect(srHp);
       srHp.connect(srLp);
       srLp.connect(srAllPass);
@@ -785,11 +922,6 @@ export class StageAudioPlayer {
 
     this.activeMasterSum = masterSum;
     this.activeCleanupNodes = cleanupNodes;
-
-    const offset = this.startOffset >= this.buffer.duration ? 0 : this.startOffset;
-    source.start(0, offset);
-
-    this.sourceNode = source;
     this.busGains = busGains;
     this.leftAnalyser = leftAnalyser;
     this.rightAnalyser = rightAnalyser;
@@ -797,87 +929,64 @@ export class StageAudioPlayer {
     this.centerAnalyser = centerAnalyser;
     this.slAnalyser = slAnalyser;
     this.srAnalyser = srAnalyser;
-    this.startedAt = ctx.currentTime - offset;
-    this.orbitPhaseBase = ((offset / this.orbitPeriodSec) % 1 + 1) % 1;
+    this.spectrumAnalyser = spectrumAnalyser;
+    this.graphBuiltForFormat = this.exportFormat;
+    this.graphBuiltForChannels = this.trackChannels;
+  }
+
+  async play() {
+    if (!this.hasLoadedTrack || !this.audioEl || this.isPlaying) return;
+    const ctx = this.ensureContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+
+    if (
+      !this.activeMasterSum ||
+      this.graphBuiltForFormat !== this.exportFormat ||
+      this.graphBuiltForChannels !== this.trackChannels
+    ) {
+      this.rebuildSpatialGraph(ctx);
+    }
+
+    const pos = this.audioEl.currentTime || 0;
+    this.orbitPhaseBase = (((pos / this.orbitPeriodSec) % 1) + 1) % 1;
     this.orbitPhaseRefTime = ctx.currentTime;
-    this.isPlaying = true;
-    this.playbackEnded = false;
     this.bassMovingAvg = 0;
     this.bassBeatState = 0;
 
-    source.onended = () => {
-      if (this.sourceNode === source) {
-        this.playbackEnded = true;
-        this.isPlaying = false;
-        this.startOffset = 0;
-        this.sourceNode = null;
-        this.busGains = null;
-        this.cancelMeterLoop();
-        this.clearAnalyserData();
-        this.onTimeCallback?.(0, false);
-      }
-    };
-
+    await this.audioEl.play();
+    this.isPlaying = true;
+    this.onTimeCallback?.(pos, true);
     this.startMeterLoop();
   }
 
   pause() {
-    if (!this.isPlaying || !this.ctx) return;
-    this.startOffset = Math.max(0, this.ctx.currentTime - this.startedAt);
-    this.stopSourceOnly();
-    this.busGains = null;
+    if (!this.isPlaying || !this.audioEl) return;
+    this.audioEl.pause();
+    const pos = this.audioEl.currentTime || 0;
     this.isPlaying = false;
     this.cancelMeterLoop();
     this.clearAnalyserData();
-    this.onTimeCallback?.(this.startOffset, false);
+    this.onTimeCallback?.(pos, false);
   }
 
   stop() {
-    this.stopSourceOnly();
-    this.busGains = null;
+    if (this.audioEl) {
+      this.audioEl.pause();
+      try {
+        this.audioEl.currentTime = 0;
+      } catch {
+        // Ignore seek reset before source is loaded
+      }
+    }
     this.isPlaying = false;
-    this.playbackEnded = false;
-    this.startOffset = 0;
     this.cancelMeterLoop();
     this.clearAnalyserData();
     this.onTimeCallback?.(0, false);
   }
 
-  private stopSourceOnly() {
-    if (this.sourceNode) {
-      try {
-        this.sourceNode.onended = null;
-        this.sourceNode.stop();
-        this.sourceNode.disconnect();
-      } catch {
-        // Ignore already stopped source
-      }
-      this.sourceNode = null;
-    }
-    if (this.activeMasterSum) {
-      try {
-        this.activeMasterSum.disconnect();
-      } catch {
-        // Ignore disconnect errors
-      }
-      this.activeMasterSum = null;
-    }
-    for (const node of this.activeCleanupNodes) {
-      try {
-        node.disconnect();
-      } catch {
-        // Ignore already disconnected node
-      }
-    }
-    this.activeCleanupNodes = [];
-    this.binauralPanNode = null;
-    this.binauralPinnaFilter = null;
-    this.binauralDelayL = null;
-    this.binauralDelayR = null;
-  }
-
   private clearAnalyserData() {
-    // 128 is digital silence in unsigned 8-bit time-domain data; 0 is silence in frequency bins
     this.bufL.fill(128);
     this.bufR.fill(128);
     this.bufCenter.fill(128);
@@ -885,6 +994,8 @@ export class StageAudioPlayer {
     this.bufSR.fill(128);
     this.bufLowTime.fill(128);
     this.bufLowFreq.fill(0);
+    this.bufSpectrumFreq.fill(0);
+    this.spectrumBands.fill(0);
     this.bassMovingAvg = 0;
     this.bassBeatState = 0;
     this.onLevelsCallback?.({ ...ZERO_LEVELS });
@@ -914,10 +1025,8 @@ export class StageAudioPlayer {
     }
     if (count === 0) return 0;
     const rms = Math.sqrt(sumSq / count);
-    // Blend RMS body (70%) + instantaneous peak transient (30%) so beats & subtle phrases pop
     const rawLevel = (rms * 0.72 + maxAbs * 0.28) * boost;
     if (rawLevel <= 0.004) return 0;
-    // Soft-knee perceptual compression boosts quiet/subtle signals while smoothly preventing clipping
     return Math.min(0.98, Math.pow(Math.min(1.35, rawLevel), 0.72) * 0.88);
   }
 
@@ -927,7 +1036,6 @@ export class StageAudioPlayer {
   ): number {
     if (!analyser) return 0;
     analyser.getByteFrequencyData(freqData);
-    // With 2048-pt FFT @ 48kHz (~23.4 Hz/bin), bins 1..5 cover 23 Hz - 125 Hz sub-bass!
     let peak = 0;
     let sum = 0;
     for (let b = 1; b <= 5; b++) {
@@ -937,7 +1045,6 @@ export class StageAudioPlayer {
     }
     const avg = sum / 5;
     const blended = (peak * 0.62 + avg * 0.38) / 255;
-    // Low noise gate (0.04) + responsive exponent makes subtle & heavy bass drops punch cleanly
     const gated = Math.max(0, (blended - 0.04) / 0.96);
     return Math.min(0.98, Math.pow(Math.min(1.25, gated * 1.48), 0.78));
   }
@@ -952,10 +1059,10 @@ export class StageAudioPlayer {
     const tick = (frameNowMs: number) => {
       if (
         !this.isPlaying ||
-        this.playbackEnded ||
         !this.ctx ||
-        !this.buffer ||
-        !this.sourceNode ||
+        !this.audioEl ||
+        this.audioEl.paused ||
+        this.audioEl.ended ||
         this.ctx.state !== 'running'
       ) {
         this.rafId = null;
@@ -963,19 +1070,9 @@ export class StageAudioPlayer {
         return;
       }
 
-      const elapsed = Math.max(0, this.ctx.currentTime - this.startedAt);
-      if (elapsed >= this.buffer.duration) {
-        this.playbackEnded = true;
-        this.isPlaying = false;
-        this.startOffset = 0;
-        this.rafId = null;
-        this.clearAnalyserData();
-        this.onTimeCallback?.(0, false);
-        return;
-      }
+      const elapsed = Math.max(0, this.audioEl.currentTime || 0);
 
-      // Cap AnalyserNode FFT/time-domain polling to ~40Hz (24ms) to avoid 120Hz mobile CPU saturation
-      if (frameNowMs - lastPollMs >= 24) {
+      if (frameNowMs - lastPollMs >= 20) {
         lastPollMs = frameNowMs;
 
         const rmsL = this.computeRms(this.leftAnalyser, this.bufL, 4.6);
@@ -996,6 +1093,18 @@ export class StageAudioPlayer {
         this.bassMovingAvg = beatRes.nextAvg;
         this.bassBeatState = beatRes.beat;
 
+        if (this.spectrumAnalyser) {
+          this.spectrumAnalyser.getByteFrequencyData(this.bufSpectrumFreq);
+          extractLogFrequencyBands(
+            this.bufSpectrumFreq,
+            this.ctx.sampleRate || 48000,
+            this.spectrumAnalyser.fftSize,
+            this.spectrumBands,
+          );
+        } else {
+          this.spectrumBands.fill(0);
+        }
+
         if (
           this.exportFormat === '8d-spatial' &&
           this.binauralPanNode &&
@@ -1014,7 +1123,6 @@ export class StageAudioPlayer {
           this.binauralPanNode.pan.setTargetAtTime(pan * 0.94, now, 0.015);
           const cutoff = 3800 + 11700 * ((depth + 1) * 0.5);
           this.binauralPinnaFilter.frequency.setTargetAtTime(cutoff, now, 0.02);
-          // 1ms safe base delay avoids 0ms interpolation clicks on mobile browsers
           this.binauralDelayL.delayTime.setTargetAtTime(0.001 + Math.max(0, pan) * 0.00062, now, 0.015);
           this.binauralDelayR.delayTime.setTargetAtTime(0.001 + Math.max(0, -pan) * 0.00062, now, 0.015);
 
@@ -1044,6 +1152,7 @@ export class StageAudioPlayer {
             SR: Math.min(1, baseEnergy * (0.15 + 0.85 * wSR) * gains.SR),
             lfeBeat: gains.LFE <= 0.001 ? 0 : beatRes.beat,
             orbitAngleDeg,
+            spectrum: this.spectrumBands,
           };
 
           if (this.busGains && (this.ctx.destination.maxChannelCount || 2) >= 6) {
@@ -1065,12 +1174,12 @@ export class StageAudioPlayer {
             SL: Math.min(1, rmsSL * surroundWeight * gains.SL),
             SR: Math.min(1, rmsSR * surroundWeight * gains.SR),
             lfeBeat: gains.LFE <= 0.001 ? 0 : beatRes.beat,
+            spectrum: this.spectrumBands,
           };
           this.onLevelsCallback?.(levels);
         }
       }
 
-      // Throttle React timeline state updates to ~5 Hz (200ms) or integer second boundary to stop 60Hz full-tree re-renders
       const secBucket = Math.floor(elapsed);
       if (frameNowMs - lastTimeEmitMs >= 200 || secBucket !== lastSecondBucket) {
         lastTimeEmitMs = frameNowMs;
@@ -1115,7 +1224,6 @@ export class StageAudioPlayer {
 
     osc.type = channelId === 'LFE' ? 'sine' : 'triangle';
     osc.frequency.setValueAtTime(freqMap[channelId], now);
-
     panner.pan.setValueAtTime(panMap[channelId], now);
 
     const chGains = computeEffectiveChannelGains(this.channels);
@@ -1135,6 +1243,22 @@ export class StageAudioPlayer {
 
   dispose() {
     this.stop();
+    this.tearDownSpatialGraph();
+    if (this.mediaSource) {
+      try {
+        this.mediaSource.disconnect();
+      } catch {
+        // Ignore disconnect error
+      }
+      this.mediaSource = null;
+    }
+    if (this.audioEl) {
+      this.audioEl.pause();
+      this.audioEl.removeAttribute('src');
+      this.audioEl.load();
+      this.audioEl = null;
+    }
+    this.revokeCurrentUrl();
     if (this.ctx && this.ctx.state !== 'closed') {
       this.ctx.close().catch(() => undefined);
     }

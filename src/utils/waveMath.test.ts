@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  computeEdgeTaper,
   computeWaveEnergy,
+  extractLogFrequencyBands,
+  stepFullWidthStudioWave,
   stepSmoothedWavePoints,
+  STUDIO_BAND_COUNT,
   WAVE_POINT_COUNT,
 } from './waveMath';
 import { ZERO_LEVELS } from './stageAudioPlayer';
@@ -65,3 +69,60 @@ test('stepSmoothedWavePoints tapers endpoints to 0 and stays jitter-free and bou
   }
   assert.ok(idleMax > 0.01 && idleMax < 0.18, `expected calm idle wave, got ${idleMax}`);
 });
+
+test('computeEdgeTaper keeps healthy minimum floor at both ends without edge dead zones', () => {
+  const leftEdge = computeEdgeTaper(0, 0.44);
+  const center = computeEdgeTaper(0.5, 0.44);
+  const rightEdge = computeEdgeTaper(1, 0.44);
+
+  assert.ok(Math.abs(leftEdge - 0.44) < 0.001);
+  assert.ok(Math.abs(rightEdge - 0.44) < 0.001);
+  assert.ok(Math.abs(center - 1.0) < 0.001);
+});
+
+test('extractLogFrequencyBands and stepFullWidthStudioWave produce responsive edge and center motion', () => {
+  const fftBins = new Uint8Array(1024);
+  fftBins.fill(150); // broadband signal across low, mid, and high bins
+  const bands = extractLogFrequencyBands(fftBins, 48000, 2048);
+
+  assert.equal(bands.length, STUDIO_BAND_COUNT);
+  assert.ok(bands[0] > 0.4, `expected active low-frequency left band, got ${bands[0]}`);
+  assert.ok(bands[32] > 0.4, `expected active mid band, got ${bands[32]}`);
+  assert.ok(bands[63] > 0.4, `expected active high-frequency right band, got ${bands[63]}`);
+
+  const state = {
+    bands: new Float32Array(STUDIO_BAND_COUNT),
+    peakCaps: new Float32Array(STUDIO_BAND_COUNT),
+    primaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    secondaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    phase: 0,
+  };
+
+  let edgeLeftMax = 0;
+  let edgeRightMax = 0;
+  let centerMax = 0;
+
+  for (let f = 0; f < 45; f++) {
+    stepFullWidthStudioWave(state, bands, f * 0.02, 0.82, 0.02, true);
+    edgeLeftMax = Math.max(edgeLeftMax, Math.abs(state.primaryWave[2]));
+    edgeRightMax = Math.max(edgeRightMax, Math.abs(state.primaryWave[STUDIO_BAND_COUNT - 3]));
+    centerMax = Math.max(centerMax, Math.abs(state.primaryWave[STUDIO_BAND_COUNT / 2]));
+  }
+
+  assert.ok(edgeLeftMax > 0.16, `expected active left edge excursion, got ${edgeLeftMax}`);
+  assert.ok(edgeRightMax > 0.16, `expected active right edge excursion, got ${edgeRightMax}`);
+  assert.ok(centerMax > 0.24, `expected active center excursion, got ${centerMax}`);
+
+  // Regression: sharp energy swing even at huge session uptime (e.g., 500s) must NOT cause phase jumps/racing
+  const prevWave = new Float32Array(state.primaryWave);
+  stepFullWidthStudioWave(state, bands, 500.0, 0.15, 0.016, true);
+  let maxStepDelta = 0;
+  for (let i = 0; i < STUDIO_BAND_COUNT; i++) {
+    maxStepDelta = Math.max(maxStepDelta, Math.abs(state.primaryWave[i] - prevWave[i]));
+  }
+  assert.ok(
+    maxStepDelta < 0.25,
+    `expected smooth frame-to-frame dance without phase jump, got ${maxStepDelta}`,
+  );
+});
+
