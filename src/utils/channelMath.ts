@@ -525,8 +525,14 @@ export function decodePcmWavToChannels(
     pos = payloadPos + chunkSize + (chunkSize % 2);
   }
 
-  if (dataOffset < 0 || dataLength <= 0 || numChannels <= 0) {
+  if (dataOffset < 0 || numChannels <= 0) {
     throw new Error('WAV data chunk missing or empty.');
+  }
+  if (dataLength === 0) {
+    return {
+      sampleRate,
+      channels: Array.from({ length: numChannels }, () => new Float32Array(0)),
+    };
   }
 
   const bytesPerSample = Math.max(1, bitsPerSample / 8);
@@ -775,6 +781,112 @@ class LR4Stage {
   }
 }
 
+const POW_072_N = 2048;
+const POW_072_MAX = 2.85;
+const POW_072_SCALE = POW_072_N / POW_072_MAX;
+const POW_072_LUT = (() => {
+  const arr = new Float64Array(POW_072_N + 2);
+  for (let i = 0; i < arr.length; i++) {
+    arr[i] = Math.pow((i * POW_072_MAX) / POW_072_N, 0.72);
+  }
+  return arr;
+})();
+
+const BLOCK_FRAMES = 4096;
+
+function biquadCopy(
+  src: Float32Array,
+  sOff: number,
+  dst: Float64Array,
+  count: number,
+  b0: number,
+  b1: number,
+  b2: number,
+  a1: number,
+  a2: number,
+  fs: Float64Array,
+  stOff: number,
+): void {
+  let x1 = fs[stOff];
+  let x2 = fs[stOff + 1];
+  let y1 = fs[stOff + 2];
+  let y2 = fs[stOff + 3];
+  for (let i = 0; i < count; i++) {
+    const x = src[sOff + i];
+    const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = x;
+    y2 = y1;
+    y1 = y;
+    dst[i] = y;
+  }
+  fs[stOff] = x1;
+  fs[stOff + 1] = x2;
+  fs[stOff + 2] = y1;
+  fs[stOff + 3] = y2;
+}
+
+function biquadCopy64(
+  src: Float64Array,
+  dst: Float64Array,
+  count: number,
+  b0: number,
+  b1: number,
+  b2: number,
+  a1: number,
+  a2: number,
+  fs: Float64Array,
+  stOff: number,
+): void {
+  let x1 = fs[stOff];
+  let x2 = fs[stOff + 1];
+  let y1 = fs[stOff + 2];
+  let y2 = fs[stOff + 3];
+  for (let i = 0; i < count; i++) {
+    const x = src[i];
+    const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = x;
+    y2 = y1;
+    y1 = y;
+    dst[i] = y;
+  }
+  fs[stOff] = x1;
+  fs[stOff + 1] = x2;
+  fs[stOff + 2] = y1;
+  fs[stOff + 3] = y2;
+}
+
+function biquadInPlace(
+  buf: Float64Array,
+  count: number,
+  b0: number,
+  b1: number,
+  b2: number,
+  a1: number,
+  a2: number,
+  fs: Float64Array,
+  stOff: number,
+): void {
+  let x1 = fs[stOff];
+  let x2 = fs[stOff + 1];
+  let y1 = fs[stOff + 2];
+  let y2 = fs[stOff + 3];
+  for (let i = 0; i < count; i++) {
+    const x = buf[i];
+    const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1;
+    x1 = x;
+    y2 = y1;
+    y1 = y;
+    buf[i] = y;
+  }
+  fs[stOff] = x1;
+  fs[stOff + 1] = x2;
+  fs[stOff + 2] = y1;
+  fs[stOff + 3] = y2;
+}
+
 /**
  * True Pro Logic II active spatial matrix upmixing processor for 5.1 channel surround.
  * Channel order: [0: FL, 1: FR, 2: C, 3: LFE, 4: SL, 5: SR]
@@ -800,15 +912,24 @@ export class StreamingMatrixUpmix51 {
   private readonly gains: Record<ChannelId, number>;
   private readonly profile: UpmixProfile;
 
-  private readonly lfeStage: LR4Stage;
-  private readonly lLowStage: LR4Stage;
-  private readonly lAboveStage: LR4Stage;
-  private readonly lVocalStage: LR4Stage;
-  private readonly lAirStage: LR4Stage;
-  private readonly rLowStage: LR4Stage;
-  private readonly rAboveStage: LR4Stage;
-  private readonly rVocalStage: LR4Stage;
-  private readonly rAirStage: LR4Stage;
+  private readonly lfeC: BiquadCoeffs;
+  private readonly lp150C: BiquadCoeffs;
+  private readonly hp150C: BiquadCoeffs;
+  private readonly lp6500C: BiquadCoeffs;
+  private readonly hp6500C: BiquadCoeffs;
+  // 18 cascaded biquads (9 LR4 stages) * 4 state variables [x1, x2, y1, y2] = 72 doubles
+  private readonly fltState = new Float64Array(72);
+
+  // Reusable L1-cache-resident sub-block scratch buffers
+  private readonly bufLLow = new Float64Array(BLOCK_FRAMES);
+  private readonly bufLAbove = new Float64Array(BLOCK_FRAMES);
+  private readonly bufLVocal = new Float64Array(BLOCK_FRAMES);
+  private readonly bufLAir = new Float64Array(BLOCK_FRAMES);
+  private readonly bufRLow = new Float64Array(BLOCK_FRAMES);
+  private readonly bufRAbove = new Float64Array(BLOCK_FRAMES);
+  private readonly bufRVocal = new Float64Array(BLOCK_FRAMES);
+  private readonly bufRAir = new Float64Array(BLOCK_FRAMES);
+  private readonly bufLfe = new Float64Array(BLOCK_FRAMES);
 
   private readonly alphaSurHp: number;
   private slHpPrevX = 0;
@@ -865,13 +986,6 @@ export class StreamingMatrixUpmix51 {
   private readonly lfeBoost: number;
   private readonly antiPhaseMask: number;
 
-  private out0 = 0;
-  private out1 = 0;
-  private out2 = 0;
-  private out3 = 0;
-  private out4 = 0;
-  private out5 = 0;
-
   constructor(
     gains: Record<ChannelId, number>,
     profile: UpmixProfile,
@@ -880,21 +994,11 @@ export class StreamingMatrixUpmix51 {
     this.gains = gains;
     this.profile = profile;
 
-    this.lfeStage = new LR4Stage(createButterworthLpfCoeffs(110, sampleRate));
-    const lp150Coeffs = createButterworthLpfCoeffs(150, sampleRate);
-    const hp150Coeffs = createButterworthHpfCoeffs(150, sampleRate);
-    const lp6500Coeffs = createButterworthLpfCoeffs(6500, sampleRate);
-    const hp6500Coeffs = createButterworthHpfCoeffs(6500, sampleRate);
-
-    this.lLowStage = new LR4Stage(lp150Coeffs);
-    this.lAboveStage = new LR4Stage(hp150Coeffs);
-    this.lVocalStage = new LR4Stage(lp6500Coeffs);
-    this.lAirStage = new LR4Stage(hp6500Coeffs);
-
-    this.rLowStage = new LR4Stage(lp150Coeffs);
-    this.rAboveStage = new LR4Stage(hp150Coeffs);
-    this.rVocalStage = new LR4Stage(lp6500Coeffs);
-    this.rAirStage = new LR4Stage(hp6500Coeffs);
+    this.lfeC = createButterworthLpfCoeffs(110, sampleRate);
+    this.lp150C = createButterworthLpfCoeffs(150, sampleRate);
+    this.hp150C = createButterworthHpfCoeffs(150, sampleRate);
+    this.lp6500C = createButterworthLpfCoeffs(6500, sampleRate);
+    this.hp6500C = createButterworthHpfCoeffs(6500, sampleRate);
 
     const dt = 1 / sampleRate;
     const rcSurHp = 1 / (2 * Math.PI * 110);
@@ -933,139 +1037,592 @@ export class StreamingMatrixUpmix51 {
     this.antiPhaseMask = profile === 'ambient-hall' ? 0.85 : 1.0;
   }
 
-  private processSample(l: number, r: number): void {
-    const mid = (l + r) * 0.5;
-    const side = (l - r) * 0.5;
+  private filterSubBlock(leftIn: Float32Array, rightIn: Float32Array, sOff: number, count: number): void {
+    const fs = this.fltState;
+    const lp1 = this.lp150C;
+    const hp1 = this.hp150C;
+    const lp6 = this.lp6500C;
+    const hp6 = this.hp6500C;
+    const lfe = this.lfeC;
 
-    const lLow = this.lLowStage.process(l);
-    const lAbove = this.lAboveStage.process(l);
-    const lVocal = this.lVocalStage.process(lAbove);
-    const lAir = this.lAirStage.process(lAbove);
+    biquadCopy(leftIn, sOff, this.bufLLow, count, lp1.b0, lp1.b1, lp1.b2, lp1.a1, lp1.a2, fs, 8);
+    biquadInPlace(this.bufLLow, count, lp1.b0, lp1.b1, lp1.b2, lp1.a1, lp1.a2, fs, 12);
+    biquadCopy(leftIn, sOff, this.bufLAbove, count, hp1.b0, hp1.b1, hp1.b2, hp1.a1, hp1.a2, fs, 16);
+    biquadInPlace(this.bufLAbove, count, hp1.b0, hp1.b1, hp1.b2, hp1.a1, hp1.a2, fs, 20);
+    biquadCopy64(this.bufLAbove, this.bufLVocal, count, lp6.b0, lp6.b1, lp6.b2, lp6.a1, lp6.a2, fs, 24);
+    biquadInPlace(this.bufLVocal, count, lp6.b0, lp6.b1, lp6.b2, lp6.a1, lp6.a2, fs, 28);
+    biquadCopy64(this.bufLAbove, this.bufLAir, count, hp6.b0, hp6.b1, hp6.b2, hp6.a1, hp6.a2, fs, 32);
+    biquadInPlace(this.bufLAir, count, hp6.b0, hp6.b1, hp6.b2, hp6.a1, hp6.a2, fs, 36);
 
-    const rLow = this.rLowStage.process(r);
-    const rAbove = this.rAboveStage.process(r);
-    const rVocal = this.rVocalStage.process(rAbove);
-    const rAir = this.rAirStage.process(rAbove);
+    biquadCopy(rightIn, sOff, this.bufRLow, count, lp1.b0, lp1.b1, lp1.b2, lp1.a1, lp1.a2, fs, 40);
+    biquadInPlace(this.bufRLow, count, lp1.b0, lp1.b1, lp1.b2, lp1.a1, lp1.a2, fs, 44);
+    biquadCopy(rightIn, sOff, this.bufRAbove, count, hp1.b0, hp1.b1, hp1.b2, hp1.a1, hp1.a2, fs, 48);
+    biquadInPlace(this.bufRAbove, count, hp1.b0, hp1.b1, hp1.b2, hp1.a1, hp1.a2, fs, 52);
+    biquadCopy64(this.bufRAbove, this.bufRVocal, count, lp6.b0, lp6.b1, lp6.b2, lp6.a1, lp6.a2, fs, 56);
+    biquadInPlace(this.bufRVocal, count, lp6.b0, lp6.b1, lp6.b2, lp6.a1, lp6.a2, fs, 60);
+    biquadCopy64(this.bufRAbove, this.bufRAir, count, hp6.b0, hp6.b1, hp6.b2, hp6.a1, hp6.a2, fs, 64);
+    biquadInPlace(this.bufRAir, count, hp6.b0, hp6.b1, hp6.b2, hp6.a1, hp6.a2, fs, 68);
 
-    const vMid = (lVocal + rVocal) * 0.5;
-    const vSide = (lVocal - rVocal) * 0.5;
+    const bLfe = this.bufLfe;
+    for (let i = 0; i < count; i++) {
+      bLfe[i] = (leftIn[sOff + i] + rightIn[sOff + i]) * 0.5;
+    }
+    biquadInPlace(bLfe, count, lfe.b0, lfe.b1, lfe.b2, lfe.a1, lfe.a2, fs, 0);
+    biquadInPlace(bLfe, count, lfe.b0, lfe.b1, lfe.b2, lfe.a1, lfe.a2, fs, 4);
+  }
+
+  private mixSubBlockWav(
+    leftIn: Float32Array,
+    rightIn: Float32Array,
+    sOff: number,
+    count: number,
+    pcm16: Int16Array | null,
+    pcmStartIdx: number,
+    fallbackView: DataView | null,
+    fallbackByteOffset: number,
+    sumSq: Float64Array,
+    totalChunkFrames: number,
+    chunkFrameBase: number,
+    fadeStart: number,
+    fadeLen: number,
+    applyEndFade: boolean,
+  ): void {
+    const bLLow = this.bufLLow;
+    const bLVoc = this.bufLVocal;
+    const bLAir = this.bufLAir;
+    const bRLow = this.bufRLow;
+    const bRVoc = this.bufRVocal;
+    const bRAir = this.bufRAir;
+    const bLfe = this.bufLfe;
 
     const ps = this.pwrSmooth;
     const pa = this.pwrAlpha;
-    this.pwrL = this.pwrL * ps + l * l * pa;
-    this.pwrR = this.pwrR * ps + r * r * pa;
-    this.pwrCross = this.pwrCross * ps + l * r * pa;
+    let pwrL = this.pwrL;
+    let pwrR = this.pwrR;
+    let pwrCross = this.pwrCross;
+    let vPwrL = this.vPwrL;
+    let vPwrR = this.vPwrR;
+    let vPwrM = this.vPwrM;
+    let vPwrS = this.vPwrS;
+    let vPwrCross = this.vPwrCross;
 
-    const totalPwr = this.pwrL + this.pwrR + 1e-7;
-    const corrNorm = Math.max(-1, Math.min(1, (2 * this.pwrCross) / totalPwr));
-    const pwrM = 0.25 * (this.pwrL + this.pwrR + 2 * this.pwrCross);
-    const pwrS = 0.25 * (this.pwrL + this.pwrR - 2 * this.pwrCross);
+    const alphaSurHp = this.alphaSurHp;
+    const alphaSurLp = this.alphaSurLp;
+    const alphaEchoDamp = this.alphaEchoDamp;
+    let slHpPrevX = this.slHpPrevX;
+    let slHpPrevY = this.slHpPrevY;
+    let srHpPrevX = this.srHpPrevX;
+    let srHpPrevY = this.srHpPrevY;
+    let slLpY = this.slLpY;
+    let srLpY = this.srLpY;
+    let slEchoDampY = this.slEchoDampY;
+    let srEchoDampY = this.srEchoDampY;
 
-    this.vPwrL = this.vPwrL * ps + lVocal * lVocal * pa;
-    this.vPwrR = this.vPwrR * ps + rVocal * rVocal * pa;
-    this.vPwrM = this.vPwrM * ps + vMid * vMid * pa;
-    this.vPwrS = this.vPwrS * ps + vSide * vSide * pa;
-    this.vPwrCross = this.vPwrCross * ps + lVocal * rVocal * pa;
+    const apBufSL = this.apBufSL;
+    const apBufSR = this.apBufSR;
+    const apLenSL = this.apLenSL;
+    const apLenSR = this.apLenSR;
+    const apGain = this.apGain;
+    let apIdxSL = this.apIdxSL;
+    let apIdxSR = this.apIdxSR;
 
-    const vTotalPwr = this.vPwrL + this.vPwrR + 1e-7;
-    const vCorrNorm = Math.max(-1, Math.min(1, (2 * this.vPwrCross) / vTotalPwr));
-    const vMsRatio = (this.vPwrM - this.vPwrS) / (this.vPwrM + this.vPwrS + 1e-7);
-
-    const vocalCenterCorr =
-      vCorrNorm <= 0.01 || vMsRatio <= 0
-        ? 0
-        : Math.min(1, Math.pow(vCorrNorm / 0.36, 0.72) * Math.min(1, vMsRatio * 2.2));
-
-    const antiCorr = Math.max(0, Math.min(1, -corrNorm));
-    const surrDominance = Math.max(0, Math.min(1, (pwrS - pwrM) / (pwrM + pwrS + 1e-7)));
-    const surrCancel = Math.max(0, Math.min(1, Math.sqrt(antiCorr * Math.max(0.08, surrDominance)) * 1.02));
-
-    const extractedCenter = vMid * vocalCenterCorr;
-
-    const stereoOverlap = Math.max(0, 1 - Math.abs(this.vPwrL - this.vPwrR) / vTotalPwr);
-    const sideMusicBoost = vSide * this.stereoWidthBoost * stereoOverlap * (1 - antiCorr);
-    const surrAtten = surrCancel * this.antiPhaseMask;
-    const lowSide = (lLow - rLow) * 0.5;
-    const airSide = (lAir - rAir) * 0.5;
-
-    const frontVocalL = lVocal - extractedCenter * this.vocalCancel + sideMusicBoost - vSide * surrAtten;
-    const frontVocalR = rVocal - extractedCenter * this.vocalCancel - sideMusicBoost + vSide * surrAtten;
-
-    const frontBeatAirL = (lLow - lowSide * surrAtten + (lAir - airSide * surrAtten)) * this.frontBeatAirGain;
-    const frontBeatAirR = (rLow + lowSide * surrAtten + (rAir + airSide * surrAtten)) * this.frontBeatAirGain;
-
-    const frontL = frontBeatAirL + frontVocalL;
-    const frontR = frontBeatAirR + frontVocalR;
-    const yLfe = this.lfeStage.process(mid);
-
-    const balanceL = Math.sqrt(Math.max(0, this.pwrL / totalPwr));
-    const balanceR = Math.sqrt(Math.max(0, this.pwrR / totalPwr));
-    const surrSteer =
-      this.profile === 'direct-discrete'
-        ? Math.max(0.65, Math.min(1.2, antiCorr * 1.3 + surrDominance * 0.75 + 0.35))
-        : Math.max(0.85, Math.min(1.28, antiCorr * 1.35 + surrDominance * 0.8 + 0.55));
-
-    const slRaw = side * balanceL * 1.4 * this.surroundGain * surrSteer;
-    const srRaw = -side * balanceR * 1.4 * this.surroundGain * surrSteer;
-
-    const slHp = this.alphaSurHp * (this.slHpPrevY + slRaw - this.slHpPrevX);
-    this.slHpPrevX = slRaw;
-    this.slHpPrevY = slHp;
-    this.slLpY = this.slLpY + this.alphaSurLp * (slHp - this.slLpY);
-
-    const srHp = this.alphaSurHp * (this.srHpPrevY + srRaw - this.srHpPrevX);
-    this.srHpPrevX = srRaw;
-    this.srHpPrevY = srHp;
-    this.srLpY = this.srLpY + this.alphaSurLp * (srHp - this.srLpY);
-
-    const apDelayedSL = this.apBufSL[this.apIdxSL];
-    const apOutSL = apDelayedSL - this.apGain * this.slLpY;
-    this.apBufSL[this.apIdxSL] = this.slLpY + this.apGain * apOutSL;
-    if (++this.apIdxSL >= this.apLenSL) this.apIdxSL = 0;
-
-    const apDelayedSR = this.apBufSR[this.apIdxSR];
-    const apOutSR = apDelayedSR - this.apGain * this.srLpY;
-    this.apBufSR[this.apIdxSR] = this.srLpY + this.apGain * apOutSR;
-    if (++this.apIdxSR >= this.apLenSR) this.apIdxSR = 0;
-
+    const ringSL = this.ringSL;
+    const ringSR = this.ringSR;
     const rLenSL = this.ringLenSL;
-    let iSL = this.idxSL;
-    this.ringSL[iSL] = apOutSL;
-    let tDirL = iSL - this.tapDirectSL;
-    if (tDirL < 0) tDirL += rLenSL;
-    let tE1L = iSL - this.tapEcho1SL;
-    if (tE1L < 0) tE1L += rLenSL;
-    let tE2L = iSL - this.tapEcho2SL;
-    if (tE2L < 0) tE2L += rLenSL;
-    const slDirect = this.ringSL[tDirL];
-    const slEchoRaw = this.ringSL[tE1L] * 0.36 + this.ringSL[tE2L] * 0.22;
-    this.slEchoDampY = this.slEchoDampY + this.alphaEchoDamp * (slEchoRaw - this.slEchoDampY);
-    const surroundOutSL = slDirect * 0.88 + this.slEchoDampY;
-    if (++iSL >= rLenSL) iSL = 0;
-    this.idxSL = iSL;
-
     const rLenSR = this.ringLenSR;
+    const tapDirectSL = this.tapDirectSL;
+    const tapEcho1SL = this.tapEcho1SL;
+    const tapEcho2SL = this.tapEcho2SL;
+    const tapDirectSR = this.tapDirectSR;
+    const tapEcho1SR = this.tapEcho1SR;
+    const tapEcho2SR = this.tapEcho2SR;
+    let iSL = this.idxSL;
     let iSR = this.idxSR;
-    this.ringSR[iSR] = apOutSR;
-    let tDirR = iSR - this.tapDirectSR;
-    if (tDirR < 0) tDirR += rLenSR;
-    let tE1R = iSR - this.tapEcho1SR;
-    if (tE1R < 0) tE1R += rLenSR;
-    let tE2R = iSR - this.tapEcho2SR;
-    if (tE2R < 0) tE2R += rLenSR;
-    const srDirect = this.ringSR[tDirR];
-    const srEchoRaw = this.ringSR[tE1R] * 0.36 + this.ringSR[tE2R] * 0.22;
-    this.srEchoDampY = this.srEchoDampY + this.alphaEchoDamp * (srEchoRaw - this.srEchoDampY);
-    const surroundOutSR = srDirect * 0.88 + this.srEchoDampY;
-    if (++iSR >= rLenSR) iSR = 0;
-    this.idxSR = iSR;
 
-    this.out0 = frontL * this.gains.FL;
-    this.out1 = frontR * this.gains.FR;
-    this.out2 = extractedCenter * this.centerAmt * this.gains.C;
-    this.out3 = yLfe * this.lfeBoost * this.gains.LFE;
-    this.out4 = surroundOutSL * this.gains.SL;
-    this.out5 = surroundOutSR * this.gains.SR;
+    const centerAmtG = this.centerAmt * this.gains.C;
+    const lfeBoostG = this.lfeBoost * this.gains.LFE;
+    const gFL = this.gains.FL;
+    const gFR = this.gains.FR;
+    const gSL = this.gains.SL;
+    const gSR = this.gains.SR;
+    const vocalCancel = this.vocalCancel;
+    const stereoWidthBoost = this.stereoWidthBoost;
+    const frontBeatAirGain = this.frontBeatAirGain;
+    const antiPhaseMask = this.antiPhaseMask;
+    const surroundBase = 1.4 * this.surroundGain;
+    const isDirect = this.profile === 'direct-discrete';
+    const lut = POW_072_LUT;
+
+    let pcmIdx = pcmStartIdx;
+    let byteOffset = fallbackByteOffset;
+
+    for (let k = 0; k < count; k++) {
+      const l = leftIn[sOff + k];
+      const r = rightIn[sOff + k];
+      const side = (l - r) * 0.5;
+
+      const lLow = bLLow[k];
+      const lVocal = bLVoc[k];
+      const lAir = bLAir[k];
+      const rLow = bRLow[k];
+      const rVocal = bRVoc[k];
+      const rAir = bRAir[k];
+      const yLfe = bLfe[k];
+
+      const vMid = (lVocal + rVocal) * 0.5;
+      const vSide = (lVocal - rVocal) * 0.5;
+
+      pwrL = pwrL * ps + l * l * pa;
+      pwrR = pwrR * ps + r * r * pa;
+      pwrCross = pwrCross * ps + l * r * pa;
+
+      const totalPwr = pwrL + pwrR + 1e-7;
+      const twoCross = 2 * pwrCross;
+      const rawCorr = twoCross / totalPwr;
+      const corrNorm = rawCorr > 1 ? 1 : rawCorr < -1 ? -1 : rawCorr;
+      const pwrM = 0.25 * (pwrL + pwrR + twoCross);
+      const pwrS = 0.25 * (pwrL + pwrR - twoCross);
+
+      vPwrL = vPwrL * ps + lVocal * lVocal * pa;
+      vPwrR = vPwrR * ps + rVocal * rVocal * pa;
+      vPwrM = vPwrM * ps + vMid * vMid * pa;
+      vPwrS = vPwrS * ps + vSide * vSide * pa;
+      vPwrCross = vPwrCross * ps + lVocal * rVocal * pa;
+
+      const vTotalPwr = vPwrL + vPwrR + 1e-7;
+      const rawVCorr = (2 * vPwrCross) / vTotalPwr;
+      const vCorrNorm = rawVCorr > 1 ? 1 : rawVCorr < -1 ? -1 : rawVCorr;
+      const vMsRatio = (vPwrM - vPwrS) / (vPwrM + vPwrS + 1e-7);
+
+      let vocalCenterCorr = 0;
+      if (vCorrNorm > 0.01 && vMsRatio > 0) {
+        const scaled = (vCorrNorm / 0.36) * POW_072_SCALE;
+        const idx = scaled >= POW_072_N ? POW_072_N : (scaled | 0);
+        const y0 = lut[idx];
+        const powEst = y0 + (lut[idx + 1] - y0) * (scaled - idx);
+        const msFactor = vMsRatio * 2.2;
+        const vEst = powEst * (msFactor < 1 ? msFactor : 1);
+        vocalCenterCorr = vEst < 1 ? vEst : 1;
+      }
+
+      const antiCorr = corrNorm < 0 ? (corrNorm < -1 ? 1 : -corrNorm) : 0;
+      const rawSurrDom = (pwrS - pwrM) / (pwrM + pwrS + 1e-7);
+      const surrDominance = rawSurrDom <= 0 ? 0 : rawSurrDom >= 1 ? 1 : rawSurrDom;
+      const domFloor = surrDominance > 0.08 ? surrDominance : 0.08;
+      const rawSurrCancel = Math.sqrt(antiCorr * domFloor) * 1.02;
+      const surrCancel = rawSurrCancel >= 1 ? 1 : rawSurrCancel;
+
+      const extractedCenter = vMid * vocalCenterCorr;
+
+      const diffLR = vPwrL - vPwrR;
+      const absDiffLR = diffLR < 0 ? -diffLR : diffLR;
+      const rawOverlap = 1 - absDiffLR / vTotalPwr;
+      const stereoOverlap = rawOverlap > 0 ? rawOverlap : 0;
+      const sideMusicBoost = vSide * stereoWidthBoost * stereoOverlap * (1 - antiCorr);
+      const surrAtten = surrCancel * antiPhaseMask;
+      const lowSide = (lLow - rLow) * 0.5;
+      const airSide = (lAir - rAir) * 0.5;
+
+      const centerCut = extractedCenter * vocalCancel;
+      const vSideAtten = vSide * surrAtten;
+      const frontVocalL = lVocal - centerCut + sideMusicBoost - vSideAtten;
+      const frontVocalR = rVocal - centerCut - sideMusicBoost + vSideAtten;
+
+      const lowSideAtten = lowSide * surrAtten;
+      const airSideAtten = airSide * surrAtten;
+      const frontBeatAirL = (lLow - lowSideAtten + (lAir - airSideAtten)) * frontBeatAirGain;
+      const frontBeatAirR = (rLow + lowSideAtten + (rAir + airSideAtten)) * frontBeatAirGain;
+
+      const frontL = frontBeatAirL + frontVocalL;
+      const frontR = frontBeatAirR + frontVocalR;
+
+      const balanceL = Math.sqrt(pwrL > 0 ? pwrL / totalPwr : 0);
+      const balanceR = Math.sqrt(pwrR > 0 ? pwrR / totalPwr : 0);
+      let surrSteer: number;
+      if (isDirect) {
+        const s = antiCorr * 1.3 + surrDominance * 0.75 + 0.35;
+        surrSteer = s < 0.65 ? 0.65 : s > 1.2 ? 1.2 : s;
+      } else {
+        const s = antiCorr * 1.35 + surrDominance * 0.8 + 0.55;
+        surrSteer = s < 0.85 ? 0.85 : s > 1.28 ? 1.28 : s;
+      }
+
+      const surrScale = surroundBase * surrSteer;
+      const slRaw = side * balanceL * surrScale;
+      const srRaw = -side * balanceR * surrScale;
+
+      const slHp = alphaSurHp * (slHpPrevY + slRaw - slHpPrevX);
+      slHpPrevX = slRaw;
+      slHpPrevY = slHp;
+      slLpY = slLpY + alphaSurLp * (slHp - slLpY);
+
+      const srHp = alphaSurHp * (srHpPrevY + srRaw - srHpPrevX);
+      srHpPrevX = srRaw;
+      srHpPrevY = srHp;
+      srLpY = srLpY + alphaSurLp * (srHp - srLpY);
+
+      const apDelayedSL = apBufSL[apIdxSL];
+      const apOutSL = apDelayedSL - apGain * slLpY;
+      apBufSL[apIdxSL] = slLpY + apGain * apOutSL;
+      if (++apIdxSL >= apLenSL) apIdxSL = 0;
+
+      const apDelayedSR = apBufSR[apIdxSR];
+      const apOutSR = apDelayedSR - apGain * srLpY;
+      apBufSR[apIdxSR] = srLpY + apGain * apOutSR;
+      if (++apIdxSR >= apLenSR) apIdxSR = 0;
+
+      ringSL[iSL] = apOutSL;
+      let tDirL = iSL - tapDirectSL;
+      if (tDirL < 0) tDirL += rLenSL;
+      let tE1L = iSL - tapEcho1SL;
+      if (tE1L < 0) tE1L += rLenSL;
+      let tE2L = iSL - tapEcho2SL;
+      if (tE2L < 0) tE2L += rLenSL;
+      const slEchoRaw = ringSL[tE1L] * 0.36 + ringSL[tE2L] * 0.22;
+      slEchoDampY = slEchoDampY + alphaEchoDamp * (slEchoRaw - slEchoDampY);
+      const surroundOutSL = ringSL[tDirL] * 0.88 + slEchoDampY;
+      if (++iSL >= rLenSL) iSL = 0;
+
+      ringSR[iSR] = apOutSR;
+      let tDirR = iSR - tapDirectSR;
+      if (tDirR < 0) tDirR += rLenSR;
+      let tE1R = iSR - tapEcho1SR;
+      if (tE1R < 0) tE1R += rLenSR;
+      let tE2R = iSR - tapEcho2SR;
+      if (tE2R < 0) tE2R += rLenSR;
+      const srEchoRaw = ringSR[tE1R] * 0.36 + ringSR[tE2R] * 0.22;
+      srEchoDampY = srEchoDampY + alphaEchoDamp * (srEchoRaw - srEchoDampY);
+      const surroundOutSR = ringSR[tDirR] * 0.88 + srEchoDampY;
+      if (++iSR >= rLenSR) iSR = 0;
+
+      const o0 = frontL * gFL;
+      const o1 = frontR * gFR;
+      const o2 = extractedCenter * centerAmtG;
+      const o3 = yLfe * lfeBoostG;
+      const o4 = surroundOutSL * gSL;
+      const o5 = surroundOutSR * gSR;
+
+      let fade = 1.0;
+      const fGlobal = chunkFrameBase + k;
+      if (applyEndFade && fGlobal >= fadeStart) {
+        const p = (totalChunkFrames - 1 - fGlobal) / fadeLen;
+        fade = p <= 0 ? 0 : p >= 1 ? 1 : p;
+      }
+
+      const s0 = (o0 > -0.88 && o0 < 0.88 ? o0 : Math.tanh(o0 / 0.95) * 0.95) * fade;
+      const s1 = (o1 > -0.88 && o1 < 0.88 ? o1 : Math.tanh(o1 / 0.95) * 0.95) * fade;
+      const s2 = (o2 > -0.88 && o2 < 0.88 ? o2 : Math.tanh(o2 / 0.95) * 0.95) * fade;
+      const s3 = (o3 > -0.88 && o3 < 0.88 ? o3 : Math.tanh(o3 / 0.95) * 0.95) * fade;
+      const s4 = (o4 > -0.88 && o4 < 0.88 ? o4 : Math.tanh(o4 / 0.95) * 0.95) * fade;
+      const s5 = (o5 > -0.88 && o5 < 0.88 ? o5 : Math.tanh(o5 / 0.95) * 0.95) * fade;
+
+      if ((fGlobal & 63) === 0) {
+        sumSq[0] += s0 * s0;
+        sumSq[1] += s1 * s1;
+        sumSq[2] += s2 * s2;
+        sumSq[3] += s3 * s3;
+        sumSq[4] += s4 * s4;
+        sumSq[5] += s5 * s5;
+      }
+
+      if (pcm16) {
+        pcm16[pcmIdx] = s0 <= -1 ? -32767 : s0 >= 1 ? 32767 : Math.round(s0 * 32767);
+        pcm16[pcmIdx + 1] = s1 <= -1 ? -32767 : s1 >= 1 ? 32767 : Math.round(s1 * 32767);
+        pcm16[pcmIdx + 2] = s2 <= -1 ? -32767 : s2 >= 1 ? 32767 : Math.round(s2 * 32767);
+        pcm16[pcmIdx + 3] = s3 <= -1 ? -32767 : s3 >= 1 ? 32767 : Math.round(s3 * 32767);
+        pcm16[pcmIdx + 4] = s4 <= -1 ? -32767 : s4 >= 1 ? 32767 : Math.round(s4 * 32767);
+        pcm16[pcmIdx + 5] = s5 <= -1 ? -32767 : s5 >= 1 ? 32767 : Math.round(s5 * 32767);
+        pcmIdx += 6;
+      } else if (fallbackView) {
+        fallbackView.setInt16(byteOffset, floatToPcm16(s0), true);
+        fallbackView.setInt16(byteOffset + 2, floatToPcm16(s1), true);
+        fallbackView.setInt16(byteOffset + 4, floatToPcm16(s2), true);
+        fallbackView.setInt16(byteOffset + 6, floatToPcm16(s3), true);
+        fallbackView.setInt16(byteOffset + 8, floatToPcm16(s4), true);
+        fallbackView.setInt16(byteOffset + 10, floatToPcm16(s5), true);
+        byteOffset += 12;
+      }
+    }
+
+    this.pwrL = pwrL;
+    this.pwrR = pwrR;
+    this.pwrCross = pwrCross;
+    this.vPwrL = vPwrL;
+    this.vPwrR = vPwrR;
+    this.vPwrM = vPwrM;
+    this.vPwrS = vPwrS;
+    this.vPwrCross = vPwrCross;
+
+    this.slHpPrevX = slHpPrevX;
+    this.slHpPrevY = slHpPrevY;
+    this.srHpPrevX = srHpPrevX;
+    this.srHpPrevY = srHpPrevY;
+    this.slLpY = slLpY;
+    this.srLpY = srLpY;
+    this.slEchoDampY = slEchoDampY;
+    this.srEchoDampY = srEchoDampY;
+
+    this.apIdxSL = apIdxSL;
+    this.apIdxSR = apIdxSR;
+    this.idxSL = iSL;
+    this.idxSR = iSR;
+  }
+
+  private mixSubBlockFloat(
+    leftIn: Float32Array,
+    rightIn: Float32Array,
+    sOff: number,
+    count: number,
+    flOut: Float32Array,
+    frOut: Float32Array,
+    cOut: Float32Array,
+    lfeOut: Float32Array,
+    slOut: Float32Array,
+    srOut: Float32Array,
+  ): void {
+    const bLLow = this.bufLLow;
+    const bLVoc = this.bufLVocal;
+    const bLAir = this.bufLAir;
+    const bRLow = this.bufRLow;
+    const bRVoc = this.bufRVocal;
+    const bRAir = this.bufRAir;
+    const bLfe = this.bufLfe;
+
+    const ps = this.pwrSmooth;
+    const pa = this.pwrAlpha;
+    let pwrL = this.pwrL;
+    let pwrR = this.pwrR;
+    let pwrCross = this.pwrCross;
+    let vPwrL = this.vPwrL;
+    let vPwrR = this.vPwrR;
+    let vPwrM = this.vPwrM;
+    let vPwrS = this.vPwrS;
+    let vPwrCross = this.vPwrCross;
+
+    const alphaSurHp = this.alphaSurHp;
+    const alphaSurLp = this.alphaSurLp;
+    const alphaEchoDamp = this.alphaEchoDamp;
+    let slHpPrevX = this.slHpPrevX;
+    let slHpPrevY = this.slHpPrevY;
+    let srHpPrevX = this.srHpPrevX;
+    let srHpPrevY = this.srHpPrevY;
+    let slLpY = this.slLpY;
+    let srLpY = this.srLpY;
+    let slEchoDampY = this.slEchoDampY;
+    let srEchoDampY = this.srEchoDampY;
+
+    const apBufSL = this.apBufSL;
+    const apBufSR = this.apBufSR;
+    const apLenSL = this.apLenSL;
+    const apLenSR = this.apLenSR;
+    const apGain = this.apGain;
+    let apIdxSL = this.apIdxSL;
+    let apIdxSR = this.apIdxSR;
+
+    const ringSL = this.ringSL;
+    const ringSR = this.ringSR;
+    const rLenSL = this.ringLenSL;
+    const rLenSR = this.ringLenSR;
+    const tapDirectSL = this.tapDirectSL;
+    const tapEcho1SL = this.tapEcho1SL;
+    const tapEcho2SL = this.tapEcho2SL;
+    const tapDirectSR = this.tapDirectSR;
+    const tapEcho1SR = this.tapEcho1SR;
+    const tapEcho2SR = this.tapEcho2SR;
+    let iSL = this.idxSL;
+    let iSR = this.idxSR;
+
+    const centerAmtG = this.centerAmt * this.gains.C;
+    const lfeBoostG = this.lfeBoost * this.gains.LFE;
+    const gFL = this.gains.FL;
+    const gFR = this.gains.FR;
+    const gSL = this.gains.SL;
+    const gSR = this.gains.SR;
+    const vocalCancel = this.vocalCancel;
+    const stereoWidthBoost = this.stereoWidthBoost;
+    const frontBeatAirGain = this.frontBeatAirGain;
+    const antiPhaseMask = this.antiPhaseMask;
+    const surroundBase = 1.4 * this.surroundGain;
+    const isDirect = this.profile === 'direct-discrete';
+    const lut = POW_072_LUT;
+
+    for (let k = 0; k < count; k++) {
+      const l = leftIn[sOff + k];
+      const r = rightIn[sOff + k];
+      const side = (l - r) * 0.5;
+
+      const lLow = bLLow[k];
+      const lVocal = bLVoc[k];
+      const lAir = bLAir[k];
+      const rLow = bRLow[k];
+      const rVocal = bRVoc[k];
+      const rAir = bRAir[k];
+      const yLfe = bLfe[k];
+
+      const vMid = (lVocal + rVocal) * 0.5;
+      const vSide = (lVocal - rVocal) * 0.5;
+
+      pwrL = pwrL * ps + l * l * pa;
+      pwrR = pwrR * ps + r * r * pa;
+      pwrCross = pwrCross * ps + l * r * pa;
+
+      const totalPwr = pwrL + pwrR + 1e-7;
+      const twoCross = 2 * pwrCross;
+      const rawCorr = twoCross / totalPwr;
+      const corrNorm = rawCorr > 1 ? 1 : rawCorr < -1 ? -1 : rawCorr;
+      const pwrM = 0.25 * (pwrL + pwrR + twoCross);
+      const pwrS = 0.25 * (pwrL + pwrR - twoCross);
+
+      vPwrL = vPwrL * ps + lVocal * lVocal * pa;
+      vPwrR = vPwrR * ps + rVocal * rVocal * pa;
+      vPwrM = vPwrM * ps + vMid * vMid * pa;
+      vPwrS = vPwrS * ps + vSide * vSide * pa;
+      vPwrCross = vPwrCross * ps + lVocal * rVocal * pa;
+
+      const vTotalPwr = vPwrL + vPwrR + 1e-7;
+      const rawVCorr = (2 * vPwrCross) / vTotalPwr;
+      const vCorrNorm = rawVCorr > 1 ? 1 : rawVCorr < -1 ? -1 : rawVCorr;
+      const vMsRatio = (vPwrM - vPwrS) / (vPwrM + vPwrS + 1e-7);
+
+      let vocalCenterCorr = 0;
+      if (vCorrNorm > 0.01 && vMsRatio > 0) {
+        const scaled = (vCorrNorm / 0.36) * POW_072_SCALE;
+        const idx = scaled >= POW_072_N ? POW_072_N : (scaled | 0);
+        const y0 = lut[idx];
+        const powEst = y0 + (lut[idx + 1] - y0) * (scaled - idx);
+        const msFactor = vMsRatio * 2.2;
+        const vEst = powEst * (msFactor < 1 ? msFactor : 1);
+        vocalCenterCorr = vEst < 1 ? vEst : 1;
+      }
+
+      const antiCorr = corrNorm < 0 ? (corrNorm < -1 ? 1 : -corrNorm) : 0;
+      const rawSurrDom = (pwrS - pwrM) / (pwrM + pwrS + 1e-7);
+      const surrDominance = rawSurrDom <= 0 ? 0 : rawSurrDom >= 1 ? 1 : rawSurrDom;
+      const domFloor = surrDominance > 0.08 ? surrDominance : 0.08;
+      const rawSurrCancel = Math.sqrt(antiCorr * domFloor) * 1.02;
+      const surrCancel = rawSurrCancel >= 1 ? 1 : rawSurrCancel;
+
+      const extractedCenter = vMid * vocalCenterCorr;
+
+      const diffLR = vPwrL - vPwrR;
+      const absDiffLR = diffLR < 0 ? -diffLR : diffLR;
+      const rawOverlap = 1 - absDiffLR / vTotalPwr;
+      const stereoOverlap = rawOverlap > 0 ? rawOverlap : 0;
+      const sideMusicBoost = vSide * stereoWidthBoost * stereoOverlap * (1 - antiCorr);
+      const surrAtten = surrCancel * antiPhaseMask;
+      const lowSide = (lLow - rLow) * 0.5;
+      const airSide = (lAir - rAir) * 0.5;
+
+      const centerCut = extractedCenter * vocalCancel;
+      const vSideAtten = vSide * surrAtten;
+      const frontVocalL = lVocal - centerCut + sideMusicBoost - vSideAtten;
+      const frontVocalR = rVocal - centerCut - sideMusicBoost + vSideAtten;
+
+      const lowSideAtten = lowSide * surrAtten;
+      const airSideAtten = airSide * surrAtten;
+      const frontBeatAirL = (lLow - lowSideAtten + (lAir - airSideAtten)) * frontBeatAirGain;
+      const frontBeatAirR = (rLow + lowSideAtten + (rAir + airSideAtten)) * frontBeatAirGain;
+
+      const frontL = frontBeatAirL + frontVocalL;
+      const frontR = frontBeatAirR + frontVocalR;
+
+      const balanceL = Math.sqrt(pwrL > 0 ? pwrL / totalPwr : 0);
+      const balanceR = Math.sqrt(pwrR > 0 ? pwrR / totalPwr : 0);
+      let surrSteer: number;
+      if (isDirect) {
+        const s = antiCorr * 1.3 + surrDominance * 0.75 + 0.35;
+        surrSteer = s < 0.65 ? 0.65 : s > 1.2 ? 1.2 : s;
+      } else {
+        const s = antiCorr * 1.35 + surrDominance * 0.8 + 0.55;
+        surrSteer = s < 0.85 ? 0.85 : s > 1.28 ? 1.28 : s;
+      }
+
+      const surrScale = surroundBase * surrSteer;
+      const slRaw = side * balanceL * surrScale;
+      const srRaw = -side * balanceR * surrScale;
+
+      const slHp = alphaSurHp * (slHpPrevY + slRaw - slHpPrevX);
+      slHpPrevX = slRaw;
+      slHpPrevY = slHp;
+      slLpY = slLpY + alphaSurLp * (slHp - slLpY);
+
+      const srHp = alphaSurHp * (srHpPrevY + srRaw - srHpPrevX);
+      srHpPrevX = srRaw;
+      srHpPrevY = srHp;
+      srLpY = srLpY + alphaSurLp * (srHp - srLpY);
+
+      const apDelayedSL = apBufSL[apIdxSL];
+      const apOutSL = apDelayedSL - apGain * slLpY;
+      apBufSL[apIdxSL] = slLpY + apGain * apOutSL;
+      if (++apIdxSL >= apLenSL) apIdxSL = 0;
+
+      const apDelayedSR = apBufSR[apIdxSR];
+      const apOutSR = apDelayedSR - apGain * srLpY;
+      apBufSR[apIdxSR] = srLpY + apGain * apOutSR;
+      if (++apIdxSR >= apLenSR) apIdxSR = 0;
+
+      ringSL[iSL] = apOutSL;
+      let tDirL = iSL - tapDirectSL;
+      if (tDirL < 0) tDirL += rLenSL;
+      let tE1L = iSL - tapEcho1SL;
+      if (tE1L < 0) tE1L += rLenSL;
+      let tE2L = iSL - tapEcho2SL;
+      if (tE2L < 0) tE2L += rLenSL;
+      const slEchoRaw = ringSL[tE1L] * 0.36 + ringSL[tE2L] * 0.22;
+      slEchoDampY = slEchoDampY + alphaEchoDamp * (slEchoRaw - slEchoDampY);
+      const surroundOutSL = ringSL[tDirL] * 0.88 + slEchoDampY;
+      if (++iSL >= rLenSL) iSL = 0;
+
+      ringSR[iSR] = apOutSR;
+      let tDirR = iSR - tapDirectSR;
+      if (tDirR < 0) tDirR += rLenSR;
+      let tE1R = iSR - tapEcho1SR;
+      if (tE1R < 0) tE1R += rLenSR;
+      let tE2R = iSR - tapEcho2SR;
+      if (tE2R < 0) tE2R += rLenSR;
+      const srEchoRaw = ringSR[tE1R] * 0.36 + ringSR[tE2R] * 0.22;
+      srEchoDampY = srEchoDampY + alphaEchoDamp * (srEchoRaw - srEchoDampY);
+      const surroundOutSR = ringSR[tDirR] * 0.88 + srEchoDampY;
+      if (++iSR >= rLenSR) iSR = 0;
+
+      const o0 = frontL * gFL;
+      const o1 = frontR * gFR;
+      const o2 = extractedCenter * centerAmtG;
+      const o3 = yLfe * lfeBoostG;
+      const o4 = surroundOutSL * gSL;
+      const o5 = surroundOutSR * gSR;
+
+      const outIdx = sOff + k;
+      flOut[outIdx] = o0 > -0.9 && o0 < 0.9 ? o0 : Math.tanh(o0);
+      frOut[outIdx] = o1 > -0.9 && o1 < 0.9 ? o1 : Math.tanh(o1);
+      cOut[outIdx] = o2 > -0.9 && o2 < 0.9 ? o2 : Math.tanh(o2);
+      lfeOut[outIdx] = o3 > -0.9 && o3 < 0.9 ? o3 : Math.tanh(o3);
+      slOut[outIdx] = o4 > -0.9 && o4 < 0.9 ? o4 : Math.tanh(o4);
+      srOut[outIdx] = o5 > -0.9 && o5 < 0.9 ? o5 : Math.tanh(o5);
+    }
+
+    this.pwrL = pwrL;
+    this.pwrR = pwrR;
+    this.pwrCross = pwrCross;
+    this.vPwrL = vPwrL;
+    this.vPwrR = vPwrR;
+    this.vPwrM = vPwrM;
+    this.vPwrS = vPwrS;
+    this.vPwrCross = vPwrCross;
+
+    this.slHpPrevX = slHpPrevX;
+    this.slHpPrevY = slHpPrevY;
+    this.srHpPrevX = srHpPrevX;
+    this.srHpPrevY = srHpPrevY;
+    this.slLpY = slLpY;
+    this.srLpY = srLpY;
+    this.slEchoDampY = slEchoDampY;
+    this.srEchoDampY = srEchoDampY;
+
+    this.apIdxSL = apIdxSL;
+    this.apIdxSR = apIdxSR;
+    this.idxSL = iSL;
+    this.idxSR = iSR;
   }
 
   processToFloatArrays(
@@ -1080,14 +1637,10 @@ export class StreamingMatrixUpmix51 {
     sl: Float32Array,
     sr: Float32Array,
   ): void {
-    for (let i = start; i < end; i++) {
-      this.processSample(leftIn[i], rightIn[i]);
-      fl[i] = softLimit(this.out0);
-      fr[i] = softLimit(this.out1);
-      c[i] = softLimit(this.out2);
-      lfe[i] = softLimit(this.out3);
-      sl[i] = softLimit(this.out4);
-      sr[i] = softLimit(this.out5);
+    for (let pos = start; pos < end; pos += BLOCK_FRAMES) {
+      const count = Math.min(BLOCK_FRAMES, end - pos);
+      this.filterSubBlock(leftIn, rightIn, pos, count);
+      this.mixSubBlockFloat(leftIn, rightIn, pos, count, fl, fr, c, lfe, sl, sr);
     }
   }
 
@@ -1104,54 +1657,33 @@ export class StreamingMatrixUpmix51 {
     const dataSize = frameCount * 12;
     const buffer = new ArrayBuffer(headerSize + dataSize);
     const view = new DataView(buffer);
-    let offset = writeSixChannelWavHeader(view, frameCount, sampleRate);
+    const offset = writeSixChannelWavHeader(view, frameCount, sampleRate);
     const pcm16 = IS_LITTLE_ENDIAN
       ? new Int16Array(buffer, headerSize, frameCount * 6)
       : null;
+
     const fadeLen = applyEndFade ? Math.min(frameCount, 1024) : 0;
     const fadeStart = frameCount - fadeLen;
-    let pcmIdx = 0;
 
-    for (let f = 0; f < frameCount; f++) {
-      const i = startFrame + f;
-      let fade = 1.0;
-      if (applyEndFade && f >= fadeStart) {
-        fade = Math.max(0, Math.min(1, (frameCount - 1 - f) / fadeLen));
-      }
-      this.processSample(leftIn[i], rightIn[i]);
-      const s0 = softLimit95(this.out0) * fade;
-      const s1 = softLimit95(this.out1) * fade;
-      const s2 = softLimit95(this.out2) * fade;
-      const s3 = softLimit95(this.out3) * fade;
-      const s4 = softLimit95(this.out4) * fade;
-      const s5 = softLimit95(this.out5) * fade;
-
-      if ((f & 63) === 0) {
-        sumSq[0] += s0 * s0;
-        sumSq[1] += s1 * s1;
-        sumSq[2] += s2 * s2;
-        sumSq[3] += s3 * s3;
-        sumSq[4] += s4 * s4;
-        sumSq[5] += s5 * s5;
-      }
-
-      if (pcm16) {
-        pcm16[pcmIdx] = floatToPcm16(s0);
-        pcm16[pcmIdx + 1] = floatToPcm16(s1);
-        pcm16[pcmIdx + 2] = floatToPcm16(s2);
-        pcm16[pcmIdx + 3] = floatToPcm16(s3);
-        pcm16[pcmIdx + 4] = floatToPcm16(s4);
-        pcm16[pcmIdx + 5] = floatToPcm16(s5);
-        pcmIdx += 6;
-      } else {
-        view.setInt16(offset, floatToPcm16(s0), true);
-        view.setInt16(offset + 2, floatToPcm16(s1), true);
-        view.setInt16(offset + 4, floatToPcm16(s2), true);
-        view.setInt16(offset + 6, floatToPcm16(s3), true);
-        view.setInt16(offset + 8, floatToPcm16(s4), true);
-        view.setInt16(offset + 10, floatToPcm16(s5), true);
-        offset += 12;
-      }
+    for (let f = 0; f < frameCount; f += BLOCK_FRAMES) {
+      const count = Math.min(BLOCK_FRAMES, frameCount - f);
+      this.filterSubBlock(leftIn, rightIn, startFrame + f, count);
+      this.mixSubBlockWav(
+        leftIn,
+        rightIn,
+        startFrame + f,
+        count,
+        pcm16,
+        f * 6,
+        pcm16 ? null : view,
+        offset + f * 12,
+        sumSq,
+        frameCount,
+        f,
+        fadeStart,
+        fadeLen,
+        applyEndFade,
+      );
     }
 
     return new Uint8Array(buffer);

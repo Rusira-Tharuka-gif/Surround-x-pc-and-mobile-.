@@ -127,6 +127,7 @@ export function ConverterStudio({
   const [phase, setPhase] = useState<ConversionPhase>('idle');
   const [progressPct, setProgressPct] = useState(0);
   const [conversionElapsedMs, setConversionElapsedMs] = useState(0);
+  const [estimatedRemainingMs, setEstimatedRemainingMs] = useState<number | null>(null);
   const [conversionLogs, setConversionLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [conversionResult, setConversionResult] = useState<ConversionResult | null>(null);
@@ -379,6 +380,7 @@ export function ConverterStudio({
     setConversionLogs([]);
     setProgressPct(0);
     setConversionElapsedMs(0);
+    setEstimatedRemainingMs(null);
     conversionStartedAtRef.current = performance.now();
     if (resultUrlRef.current) {
       URL.revokeObjectURL(resultUrlRef.current);
@@ -421,8 +423,11 @@ export function ConverterStudio({
           currentPhaseRef.current = nextPhase;
           setPhase(nextPhase);
         },
-        onProgress: (pct) => {
+        onProgress: (pct, etaMs) => {
           setProgressPct((prev) => (prev === pct ? prev : pct));
+          if (etaMs !== undefined) {
+            setEstimatedRemainingMs(etaMs);
+          }
           backgroundConversionManager.updateProgress({
             jobId,
             filename: trackMeta.name,
@@ -437,6 +442,7 @@ export function ConverterStudio({
       });
 
       setConversionElapsedMs(result.elapsedMs);
+      setEstimatedRemainingMs(0);
       resultUrlRef.current = result.url;
       setConversionResult(result);
       const completedAlert = backgroundConversionManager.completeJob({
@@ -465,8 +471,10 @@ export function ConverterStudio({
         currentPhaseRef.current = 'idle';
         setPhase('idle');
         setProgressPct(0);
+        setEstimatedRemainingMs(null);
         setConversionLogs((prev) => [...prev.slice(-4), 'Conversion cancelled cleanly.']);
       } else {
+        setEstimatedRemainingMs(null);
         setErrorMessage(msg);
       }
       setAlertToast(failAlert);
@@ -497,7 +505,11 @@ export function ConverterStudio({
     return () => window.clearInterval(timer);
   }, [isConverting]);
 
-  const progressTelemetry = computeConversionTelemetry(progressPct, conversionElapsedMs);
+  const progressTelemetry = computeConversionTelemetry(
+    progressPct,
+    conversionElapsedMs,
+    estimatedRemainingMs,
+  );
 
   const activityMode: StageActivityMode = activeSweepChannel
     ? 'sweeping'

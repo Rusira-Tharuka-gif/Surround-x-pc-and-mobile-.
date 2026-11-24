@@ -5,6 +5,7 @@ import {
   buildStereoWavHeaderBytes,
   computeAdaptiveChunkDurationSec,
   computeChunkWindows,
+  isFastInputSeekFormat,
   parseAudioHeaderBytes,
 } from './audioHeader';
 import { createDemoStereoWavBuffer } from './channelMath';
@@ -91,6 +92,15 @@ test('computeAdaptiveChunkDurationSec picks fast frame-aligned windows for small
   assert.equal((mediumChunk * 48000) % 1536, 0);
   assert.equal((mediumChunk * 48000) % 512, 0);
 
+  const longCompactMp3Chunk = computeAdaptiveChunkDurationSec(18 * 1024 * 1024, 960, false);
+  assert.equal(longCompactMp3Chunk, 60);
+
+  const longHighBitrateMp3Chunk = computeAdaptiveChunkDurationSec(38 * 1024 * 1024, 960, false);
+  assert.equal(longHighBitrateMp3Chunk, 40);
+
   const largeChunk = computeAdaptiveChunkDurationSec(120 * 1024 * 1024, 1200, false);
   assert.equal(largeChunk, 20);
+
+  assert.equal(isFastInputSeekFormat('flac'), true);
+  assert.equal(isFastInputSeekFormat('mp3'), false);
 });

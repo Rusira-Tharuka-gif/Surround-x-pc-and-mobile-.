@@ -174,9 +174,9 @@ export function computeChunkWindows(
 
 /**
  * Chooses a frame-aligned chunk duration (multiples of 4s @ 48 kHz = exact multiples of
- * 1,536 AC3 frames and 512 DTS frames). Small/medium files (e.g. ~4 MB songs) use fewer,
- * larger chunks to eliminate per-chunk FFmpeg startup and seeking overhead, while large
- * tracks stay capped at 20s chunks (< 25 MB peak RAM).
+ * 1,536 AC3 frames and 512 DTS frames). Standard tracks (<= 20 MB up to 30 min) use 60s
+ * blocks, larger tracks (<= 80 MB) use 40s blocks, and huge lossless/6ch streams use 20s
+ * blocks to stay memory-safe while cutting per-chunk FFmpeg startup/seek overhead dramatically.
  */
 export function computeAdaptiveChunkDurationSec(
   sourceSizeBytes: number,
@@ -185,15 +185,21 @@ export function computeAdaptiveChunkDurationSec(
 ): number {
   const mb = sourceSizeBytes / (1024 * 1024);
   if (isDiscrete6Ch) {
-    return durationSec > 0 && durationSec <= 120 && mb <= 24 ? 40 : 20;
+    return durationSec > 0 && durationSec <= 240 && mb <= 32 ? 40 : 20;
   }
-  if (mb <= 18 && durationSec > 0 && durationSec <= 240) {
+  if (mb <= 20 && durationSec > 0 && durationSec <= 1800) {
     return 60;
   }
-  if (mb <= 32 && durationSec > 0 && durationSec <= 360) {
+  if (mb <= 80 && durationSec > 0 && durationSec <= 1800) {
     return 40;
   }
   return 20;
+}
+
+const FAST_INPUT_SEEK_FORMATS = new Set(['wav', 'flac', 'm4a', 'mp4', 'aiff']);
+
+export function isFastInputSeekFormat(ext: string): boolean {
+  return FAST_INPUT_SEEK_FORMATS.has(ext.toLowerCase());
 }
 
 /**
@@ -244,8 +250,7 @@ export function buildFfmpegChunkDecodeArgs(options: {
 
   // Input seeking (-ss before -i) is sample-exact & instant for WAV/FLAC/M4A/MP4/AIFF;
   // output seeking guarantees frame-exact continuity for VBR MP3/OGG/AAC without Xing TOCs.
-  const fastInputSeekFormats = new Set(['wav', 'flac', 'm4a', 'mp4', 'aiff']);
-  const useFastInputSeek = fastInputSeekFormats.has(inputExt.toLowerCase());
+  const useFastInputSeek = isFastInputSeekFormat(inputExt);
 
   if (useFastInputSeek) {
     return [

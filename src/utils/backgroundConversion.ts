@@ -149,8 +149,12 @@ export function shouldEmitProgressUpdate(params: {
 
 export function formatElapsedCompact(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const mins = Math.floor(totalSec / 60);
+  const hours = Math.floor(totalSec / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
   const secs = totalSec % 60;
+  if (hours > 0) {
+    return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
@@ -162,6 +166,7 @@ export interface ConversionTelemetry {
 export function computeConversionTelemetry(
   progressPct: number,
   elapsedMs: number,
+  estimatedRemainingMs?: number | null,
 ): ConversionTelemetry {
   const safeElapsed = Math.max(0, elapsedMs);
   const elapsedLabel = formatElapsedCompact(safeElapsed);
@@ -170,6 +175,18 @@ export function computeConversionTelemetry(
     return {
       elapsedLabel,
       etaLabel: `${(safeElapsed / 1000).toFixed(1)}s total`,
+    };
+  }
+
+  if (
+    typeof estimatedRemainingMs === 'number' &&
+    Number.isFinite(estimatedRemainingMs) &&
+    estimatedRemainingMs > 0
+  ) {
+    const remSec = Math.max(1, Math.ceil(estimatedRemainingMs / 1000));
+    return {
+      elapsedLabel,
+      etaLabel: `~${formatElapsedCompact(remSec * 1000)} left`,
     };
   }
 
@@ -182,11 +199,9 @@ export function computeConversionTelemetry(
 
   const remainingMs = Math.max(0, (safeElapsed * (100 - progressPct)) / progressPct);
   const remSec = Math.max(1, Math.ceil(remainingMs / 1000));
-  const remMins = Math.floor(remSec / 60);
-  const remSecs = remSec % 60;
   return {
     elapsedLabel,
-    etaLabel: `~${remMins}:${remSecs.toString().padStart(2, '0')} left`,
+    etaLabel: `~${formatElapsedCompact(remSec * 1000)} left`,
   };
 }
 

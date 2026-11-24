@@ -124,6 +124,14 @@ test('computeConversionTelemetry formats elapsed and remaining ETA cleanly', () 
   assert.equal(mid.elapsedLabel, '0:04');
   assert.equal(mid.etaLabel, '~0:04 left');
 
+  const throughputEta = computeConversionTelemetry(28, 12000, 18500);
+  assert.equal(throughputEta.elapsedLabel, '0:12');
+  assert.equal(throughputEta.etaLabel, '~0:19 left');
+
+  const hourEta = computeConversionTelemetry(20, 3665_000, 3725_000);
+  assert.equal(hourEta.elapsedLabel, '1:01:05');
+  assert.equal(hourEta.etaLabel, '~1:02:05 left');
+
   const done = computeConversionTelemetry(100, 2450);
   assert.equal(done.elapsedLabel, '0:02');
   assert.equal(done.etaLabel, '2.5s total');
