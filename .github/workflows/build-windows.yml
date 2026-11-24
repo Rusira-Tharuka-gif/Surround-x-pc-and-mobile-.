@@ -44,7 +44,61 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ runner.temp }}/repo
-        run: npm install --legacy-peer-deps
+        run: npm install --legacy-peer-deps --include=optional
+
+      - name: Verify / Repair Windows Native Bindings
+        working-directory: ${{ runner.temp }}/repo
+        shell: pwsh
+        run: |
+          @'
+          const { execFileSync } = require('node:child_process');
+          const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
+          function tryLoad(id) {
+            try {
+              require(id);
+              return null;
+            } catch (err) {
+              return err;
+            }
+          }
+
+          function installExact(spec) {
+            console.log('[ci] Installing missing/fallback package:', spec);
+            execFileSync(npmCmd, ['install', '--no-save', '--legacy-peer-deps', '--force', spec], {
+              stdio: 'inherit',
+              shell: true,
+            });
+          }
+
+          const rolldownVer = require('./node_modules/rolldown/package.json').version;
+          let err = tryLoad('@rolldown/binding-win32-x64-msvc');
+          if (err) {
+            console.warn('[ci] Native @rolldown/binding-win32-x64-msvc unavailable:', err.message);
+            installExact('@rolldown/binding-win32-x64-msvc@' + rolldownVer);
+            err = tryLoad('@rolldown/binding-win32-x64-msvc');
+          }
+          if (err) {
+            console.warn('[ci] Native rolldown still unavailable; installing WASI fallback:', err.message);
+            installExact('@rolldown/binding-wasm32-wasi@' + rolldownVer);
+          }
+
+          const lightningVer = require('./node_modules/lightningcss/package.json').version;
+          if (tryLoad('lightningcss-win32-x64-msvc')) {
+            installExact('lightningcss-win32-x64-msvc@' + lightningVer);
+          }
+
+          const oxideVer = require('./node_modules/@tailwindcss/oxide/package.json').version;
+          if (tryLoad('@tailwindcss/oxide-win32-x64-msvc')) {
+            installExact('@tailwindcss/oxide-win32-x64-msvc@' + oxideVer);
+            if (tryLoad('@tailwindcss/oxide-win32-x64-msvc') && tryLoad('@tailwindcss/oxide-wasm32-wasi')) {
+              installExact('@tailwindcss/oxide-wasm32-wasi@' + oxideVer);
+            }
+          }
+          '@ | node --input-type=commonjs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node -e "Promise.all([import('rolldown/parseAst'), import('@tailwindcss/vite')]).then(() => console.log('[ci] rolldown and tailwindcss bindings OK')).catch((e) => { console.error(e); process.exit(1); })"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Typecheck and run unit tests
         working-directory: ${{ runner.temp }}/repo
