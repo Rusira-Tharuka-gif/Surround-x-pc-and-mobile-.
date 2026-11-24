@@ -532,7 +532,7 @@ export class StageAudioPlayer {
     spectrumAnalyser.fftSize = 2048;
     spectrumAnalyser.minDecibels = -84;
     spectrumAnalyser.maxDecibels = -6;
-    spectrumAnalyser.smoothingTimeConstant = 0.78;
+    spectrumAnalyser.smoothingTimeConstant = 0.48; // Snappy real-time transient, bass drop, and beat response
 
     sourceNode.connect(splitter);
     sourceNode.connect(spectrumAnalyser);
@@ -998,7 +998,7 @@ export class StageAudioPlayer {
     this.spectrumBands.fill(0);
     this.bassMovingAvg = 0;
     this.bassBeatState = 0;
-    this.onLevelsCallback?.({ ...ZERO_LEVELS });
+    this.onLevelsCallback?.({ ...ZERO_LEVELS, spectrum: this.spectrumBands });
   }
 
   private cancelMeterLoop() {

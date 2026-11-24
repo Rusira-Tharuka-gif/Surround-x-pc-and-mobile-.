@@ -19,7 +19,18 @@ export function computeWaveEnergy(
   const surround = ((levels.SL ?? 0) + (levels.SR ?? 0)) * 0.5;
   const bass = Math.max(levels.LFE ?? 0, levels.lfeBeat ?? 0);
 
-  const weighted = front * 0.38 + center * 0.24 + surround * 0.22 + bass * 0.32;
+  let weighted = front * 0.36 + center * 0.22 + surround * 0.2 + bass * 0.34;
+
+  if (levels.spectrum && levels.spectrum.length > 0) {
+    let specSum = 0;
+    const slen = levels.spectrum.length;
+    for (let i = 0; i < slen; i++) {
+      specSum += levels.spectrum[i] ?? 0;
+    }
+    const specAvg = specSum / slen;
+    weighted = Math.max(weighted, specAvg * 1.15);
+  }
+
   const clamped = clampUnit(weighted);
   if (clamped <= 0.002) return 0;
 
@@ -203,8 +214,8 @@ export interface FullWidthWaveState {
 
 /**
  * Steps smoothed full-span studio waveform + dual-layer harmonic + peak envelope buffers
- * with frame-rate-independent exponential damping, incremental phase integration (zero
- * absolute-timestamp phase jumps), and dual-pass spatial smoothing for musical motion.
+ * directly driven by real-time frequency analysis. Low frequencies (bass/beat), mids, and
+ * highs map dynamically across the full span with snappy attack, silky release, and calm standby.
  */
 export function stepFullWidthStudioWave(
   state: FullWidthWaveState,
@@ -218,43 +229,41 @@ export function stepFullWidthStudioWave(
   const safeDt = Math.max(0.004, Math.min(0.033, Number.isFinite(dtSec) ? dtSec : 0.016));
   const safeEnergy = isActive ? clampUnit(energy) : 0;
 
-  // Frame-rate-independent exponential smoothing (silky release, crisp musical punch)
-  const attackAlpha = 1 - Math.exp(-safeDt * 13.5);
-  const releaseAlpha = 1 - Math.exp(-safeDt * 4.2);
-  const peakDecay = safeDt * 0.34;
+  // Frame-rate-independent attack/release damping (snappy 22/s attack for beats, silky 4.8/s release)
+  const attackAlpha = 1 - Math.exp(-safeDt * 22.0);
+  const releaseAlpha = 1 - Math.exp(-safeDt * 4.8);
+  const peakDecay = safeDt * 0.38;
 
   for (let i = 0; i < n; i++) {
     const rawTarget = isActive && targetBands ? clampUnit(targetBands[i] ?? 0) : 0;
     const prev = Number.isFinite(state.bands[i]) ? state.bands[i] : 0;
     const alpha = rawTarget >= prev ? attackAlpha : releaseAlpha;
     const smoothed = prev + (rawTarget - prev) * alpha;
-    state.bands[i] = smoothed < 0.002 ? 0 : smoothed;
+    state.bands[i] = smoothed < 0.001 ? 0 : smoothed;
   }
 
-  // Dual-pass 3-tap spatial smoothing so low, mid, and high bands glide cleanly without jagged spikes
+  // Dual-pass spatial smoothing keeps adjacent frequencies continuous and musical
   for (let pass = 0; pass < 2; pass++) {
     let prevVal = state.bands[0] ?? 0;
     for (let i = 1; i < n - 1; i++) {
       const cur = state.bands[i];
       const next = state.bands[i + 1];
-      const blended = prevVal * 0.2 + cur * 0.6 + next * 0.2;
+      const blended = prevVal * 0.18 + cur * 0.64 + next * 0.18;
       prevVal = cur;
       state.bands[i] = clampUnit(blended);
     }
   }
 
-  // Incremental phase accumulation prevents jumping/racing when energy fluctuates or session uptime grows
+  // Incremental phase integration prevents jumping or racing when energy fluctuates
   const currentPhase = Number.isFinite(state.phase) ? state.phase : 0;
-  const phaseRate = 0.68 + safeEnergy * 0.62;
+  const phaseRate = 0.72 + safeEnergy * 0.58;
   const nextPhase = (currentPhase + safeDt * phaseRate) % (Math.PI * 200);
   state.phase = nextPhase;
 
   for (let i = 0; i < n; i++) {
     const u = n > 1 ? i / (n - 1) : 0.5;
     const taper = computeEdgeTaper(u, 0.48);
-    const coherentFloor =
-      safeEnergy * 0.28 * (0.76 + 0.24 * Math.cos(u * Math.PI * 2 - nextPhase * 0.75));
-    const bandAmp = Math.max(state.bands[i], coherentFloor);
+    const bandAmp = state.bands[i];
 
     // Smooth peak cap envelope
     const weightedBand = clampUnit(bandAmp * taper * 1.08);
@@ -262,29 +271,37 @@ export function stepFullWidthStudioWave(
     state.peakCaps[i] =
       weightedBand >= prevPeak ? weightedBand : Math.max(weightedBand, prevPeak - peakDecay);
 
-    // Gentle standing-wave musical dance driven directly by local smoothed frequency energy
+    // Spatial carrier scales with frequency: longer wavelengths on left (bass), tighter on right (highs)
+    const k1 = 1.85 + 3.15 * u;
     const carrier1 =
-      Math.cos(u * Math.PI * 2.4 - nextPhase * 1.25) * 0.54 +
-      Math.sin(u * Math.PI * 4.2 + nextPhase * 1.55 + 0.9) * 0.3 +
-      Math.cos(u * Math.PI * 6.4 - nextPhase * 1.85 + 0.5) * 0.16;
+      Math.sin(u * Math.PI * k1 - nextPhase * (1.15 + 0.45 * u)) * 0.68 +
+      Math.cos(u * Math.PI * (k1 * 1.5) + nextPhase * 0.85) * 0.32;
 
+    const k2 = 2.35 + 3.85 * u;
     const carrier2 =
-      Math.sin(u * Math.PI * 2.2 + nextPhase * 1.05 + 0.6) * 0.58 +
-      Math.cos(u * Math.PI * 4.0 - nextPhase * 1.4 + 1.1) * 0.42;
+      Math.cos(u * Math.PI * k2 + nextPhase * (1.05 + 0.35 * u) + 0.6) * 0.62 +
+      Math.sin(u * Math.PI * (k2 * 1.4) - nextPhase * 0.75) * 0.38;
 
-    const idleAmp = 0.085;
-    const activeDrive1 = bandAmp * 0.82 + safeEnergy * 0.22;
-    const activeDrive2 = bandAmp * 0.58 + safeEnergy * 0.16;
+    // Real-time frequency-driven displacement across the full width
+    const activeDrive1 = bandAmp * 1.12 + safeEnergy * 0.16;
+    const activeDrive2 = bandAmp * 0.78 + safeEnergy * 0.12;
 
-    const targetWave1 = Math.max(-1, Math.min(1, carrier1 * (idleAmp + activeDrive1) * taper));
+    // Calm standby breathing wave when paused or quiet
+    const idleDrive1 = 0.075 * Math.sin(u * Math.PI * 2 - nextPhase * 0.8);
+    const idleDrive2 = 0.052 * Math.cos(u * Math.PI * 2.2 + nextPhase * 0.65);
+
+    const targetWave1 = Math.max(
+      -1,
+      Math.min(1, (idleDrive1 * (1 - safeEnergy) + carrier1 * activeDrive1) * taper),
+    );
     const targetWave2 = Math.max(
       -1,
-      Math.min(1, carrier2 * (idleAmp * 0.72 + activeDrive2) * taper),
+      Math.min(1, (idleDrive2 * (1 - safeEnergy) + carrier2 * activeDrive2) * taper),
     );
 
     const prevW1 = Number.isFinite(state.primaryWave[i]) ? state.primaryWave[i] : 0;
     const prevW2 = Number.isFinite(state.secondaryWave[i]) ? state.secondaryWave[i] : 0;
-    const waveBlend = 1 - Math.exp(-safeDt * 18);
+    const waveBlend = 1 - Math.exp(-safeDt * 20.0);
     state.primaryWave[i] = prevW1 + (targetWave1 - prevW1) * waveBlend;
     state.secondaryWave[i] = prevW2 + (targetWave2 - prevW2) * waveBlend;
   }

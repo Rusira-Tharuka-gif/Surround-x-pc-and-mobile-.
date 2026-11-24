@@ -126,3 +126,72 @@ test('extractLogFrequencyBands and stepFullWidthStudioWave produce responsive ed
   );
 });
 
+test('real-time frequency-driven mapping selectively differentiates bass drops vs high treble', () => {
+  // 1. Bass-only signal (bins 1 to 6 active, 40-140 Hz, e.g. 808 kick)
+  const bassOnlyBins = new Uint8Array(1024);
+  for (let b = 1; b <= 6; b++) bassOnlyBins[b] = 230;
+  const bassBands = extractLogFrequencyBands(bassOnlyBins, 48000, 2048);
+
+  const bassState = {
+    bands: new Float32Array(STUDIO_BAND_COUNT),
+    peakCaps: new Float32Array(STUDIO_BAND_COUNT),
+    primaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    secondaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    phase: 0,
+  };
+
+  for (let f = 0; f < 30; f++) {
+    stepFullWidthStudioWave(bassState, bassBands, f * 0.02, 0.75, 0.02, true);
+  }
+
+  // Left bass bands should be significantly higher than right treble bands
+  const leftBassBandAvg = (bassState.bands[1] + bassState.bands[3] + bassState.bands[5]) / 3;
+  const rightTrebleBandAvg = (bassState.bands[58] + bassState.bands[60] + bassState.bands[62]) / 3;
+  assert.ok(leftBassBandAvg > 0.45, `expected strong bass band excitation, got ${leftBassBandAvg}`);
+  assert.ok(
+    leftBassBandAvg > rightTrebleBandAvg * 3,
+    `bass bands (${leftBassBandAvg}) should dominate over treble (${rightTrebleBandAvg}) on bass hit`,
+  );
+
+  // 2. Treble-only signal (bins 200 to 500 active, 5 kHz - 12 kHz, e.g. hi-hats/cymbals)
+  const trebleOnlyBins = new Uint8Array(1024);
+  for (let b = 200; b <= 500; b++) trebleOnlyBins[b] = 220;
+  const trebleBands = extractLogFrequencyBands(trebleOnlyBins, 48000, 2048);
+
+  const trebleState = {
+    bands: new Float32Array(STUDIO_BAND_COUNT),
+    peakCaps: new Float32Array(STUDIO_BAND_COUNT),
+    primaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    secondaryWave: new Float32Array(STUDIO_BAND_COUNT),
+    phase: 0,
+  };
+
+  for (let f = 0; f < 30; f++) {
+    stepFullWidthStudioWave(trebleState, trebleBands, f * 0.02, 0.72, 0.02, true);
+  }
+
+  const leftBassBandAvg2 = (trebleState.bands[1] + trebleState.bands[3] + trebleState.bands[5]) / 3;
+  const rightTrebleBandAvg2 =
+    (trebleState.bands[50] + trebleState.bands[55] + trebleState.bands[60]) / 3;
+  assert.ok(
+    rightTrebleBandAvg2 > 0.4,
+    `expected strong treble excitation, got ${rightTrebleBandAvg2}`,
+  );
+  assert.ok(
+    rightTrebleBandAvg2 > leftBassBandAvg2 * 2,
+    `treble bands (${rightTrebleBandAvg2}) should dominate over bass (${leftBassBandAvg2}) on hi-hat/treble signal`,
+  );
+
+  // 3. Standby / Paused state decays smoothly to gentle breathing wave
+  for (let f = 0; f < 60; f++) {
+    stepFullWidthStudioWave(bassState, null, (30 + f) * 0.02, 0, 0.02, false);
+  }
+
+  let standbyMax = 0;
+  for (let i = 0; i < STUDIO_BAND_COUNT; i++) {
+    assert.ok(bassState.bands[i] < 0.01, `bands should decay to near 0 on pause`);
+    standbyMax = Math.max(standbyMax, Math.abs(bassState.primaryWave[i]));
+  }
+  assert.ok(standbyMax > 0.005 && standbyMax < 0.15, `expected calm standby wave, got ${standbyMax}`);
+});
+
