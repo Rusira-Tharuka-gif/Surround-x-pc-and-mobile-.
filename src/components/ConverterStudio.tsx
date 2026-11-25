@@ -4,10 +4,12 @@ import {
   BellRing,
   CheckCircle2,
   Download,
+  ExternalLink,
   FileAudio,
   Loader2,
   Pause,
   Play,
+  Share2,
   Sparkles,
   UploadCloud,
   X,
@@ -46,6 +48,14 @@ import {
   ZERO_LEVELS,
   type ChannelLevels,
 } from '../utils/stageAudioPlayer';
+import {
+  detectDownloadCapabilities,
+  isAndroidNativeRuntime,
+  openNativeOutputFile,
+  shareOrSaveOutputFallback,
+  triggerReliableDownload,
+  type DownloadStatusState,
+} from '../utils/fileDownload';
 import { AcousticStageMonitor, type StageActivityMode } from './AcousticStageMonitor';
 import { Spatial8DRadar } from './Spatial8DRadar';
 import { CreativeThinkingCard } from './CreativeThinkingCard';
@@ -131,6 +141,15 @@ export function ConverterStudio({
   const [conversionLogs, setConversionLogs] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [conversionResult, setConversionResult] = useState<ConversionResult | null>(null);
+  const [downloadStatus, setDownloadStatus] = useState<{
+    state: DownloadStatusState;
+    message: string;
+    savedPath?: string;
+    nativeContentUri?: string;
+    nativeShareUri?: string;
+    canShare?: boolean;
+    canOpen?: boolean;
+  } | null>(null);
   const [alertToast, setAlertToast] = useState<ConversionAlertState | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -212,6 +231,7 @@ export function ConverterStudio({
           resultUrlRef.current = null;
         }
         setConversionResult(null);
+        setDownloadStatus(null);
 
         setSourceFile(fileOrBlob);
         setTrackMeta({
@@ -377,6 +397,7 @@ export function ConverterStudio({
 
     setErrorMessage(null);
     setAlertToast(null);
+    setDownloadStatus(null);
     setConversionLogs([]);
     setProgressPct(0);
     setConversionElapsedMs(0);
@@ -453,6 +474,7 @@ export function ConverterStudio({
         sizeLabel: formatFileSize(result.sizeBytes),
       });
       setAlertToast(completedAlert);
+      void runReliableDownload(result, true);
     } catch (err) {
       const cancelled = controller.signal.aborted || isAbortError(err);
       const msg =
@@ -487,6 +509,121 @@ export function ConverterStudio({
       }
     }
   };
+
+  const runReliableDownload = useCallback(
+    async (targetResult: ConversionResult, isAuto: boolean) => {
+      setDownloadStatus((prev) => ({
+        state: 'saving',
+        message: isAndroidNativeRuntime()
+          ? `Saving ${targetResult.outputFilename} to Android Downloads...`
+          : isAuto
+            ? `Starting download for ${targetResult.outputFilename}...`
+            : `Downloading ${targetResult.outputFilename}...`,
+        savedPath: prev?.savedPath,
+        nativeContentUri: prev?.nativeContentUri,
+        nativeShareUri: prev?.nativeShareUri,
+        canShare: prev?.canShare,
+        canOpen: prev?.canOpen,
+      }));
+
+      const outcome = await triggerReliableDownload(targetResult, {
+        isAuto,
+        spatialContainer,
+      });
+
+      setDownloadStatus({
+        state: outcome.status,
+        message: outcome.message,
+        savedPath: outcome.savedPath,
+        nativeContentUri: outcome.nativeContentUri,
+        nativeShareUri: outcome.nativeShareUri,
+        canShare: outcome.canShare,
+        canOpen: outcome.canOpen,
+      });
+    },
+    [spatialContainer],
+  );
+
+  const handleManualDownload = useCallback(() => {
+    if (!conversionResult) {
+      setDownloadStatus({
+        state: 'error',
+        message: 'No converted audio file is available yet. Please convert a track first.',
+      });
+      return;
+    }
+    void runReliableDownload(conversionResult, false);
+  }, [conversionResult, runReliableDownload]);
+
+  const handleShareFallback = useCallback(async () => {
+    if (!conversionResult) return;
+    const shareRes = await shareOrSaveOutputFallback(conversionResult, {
+      spatialContainer,
+      nativeContentUri: downloadStatus?.nativeShareUri || downloadStatus?.nativeContentUri,
+      onNativeUriCreated: ({ contentUri, shareUri, savedPath }) => {
+        setDownloadStatus((prev) => ({
+          state: prev?.state ?? 'saved-native',
+          message: prev?.message ?? `Saved ${conversionResult.outputFilename}.`,
+          savedPath,
+          nativeContentUri: contentUri,
+          nativeShareUri: shareUri || contentUri,
+          canShare: true,
+          canOpen: true,
+        }));
+      },
+    });
+    if (shareRes.status !== 'cancelled') {
+      setDownloadStatus((prev) => ({
+        state: shareRes.ok ? 'shared' : 'error',
+        message: shareRes.message,
+        savedPath: prev?.savedPath,
+        nativeContentUri: prev?.nativeContentUri,
+        nativeShareUri: prev?.nativeShareUri,
+        canShare: prev?.canShare ?? true,
+        canOpen: prev?.canOpen ?? true,
+      }));
+    }
+  }, [conversionResult, downloadStatus?.nativeContentUri, downloadStatus?.nativeShareUri, spatialContainer]);
+
+  const handleOpenNativeFallback = useCallback(async () => {
+    if (!conversionResult) return;
+    const openRes = await openNativeOutputFile(conversionResult, {
+      spatialContainer,
+      nativeContentUri: downloadStatus?.nativeContentUri || downloadStatus?.nativeShareUri,
+      onNativeUriCreated: ({ contentUri, shareUri, savedPath }) => {
+        setDownloadStatus((prev) => ({
+          state: prev?.state ?? 'saved-native',
+          message: prev?.message ?? `Saved ${conversionResult.outputFilename}.`,
+          savedPath,
+          nativeContentUri: contentUri,
+          nativeShareUri: shareUri || contentUri,
+          canShare: true,
+          canOpen: true,
+        }));
+      },
+    });
+    if (!openRes.ok) {
+      setDownloadStatus((prev) => ({
+        state: 'error',
+        message: openRes.message,
+        savedPath: prev?.savedPath,
+        nativeContentUri: prev?.nativeContentUri,
+        nativeShareUri: prev?.nativeShareUri,
+        canShare: true,
+        canOpen: prev?.canOpen,
+      }));
+    }
+  }, [conversionResult, downloadStatus?.nativeContentUri, downloadStatus?.nativeShareUri, spatialContainer]);
+
+  useEffect(() => {
+    const onWebViewDownload = () => {
+      if (conversionResult) {
+        void runReliableDownload(conversionResult, false);
+      }
+    };
+    window.addEventListener('surroundx-webview-download', onWebViewDownload);
+    return () => window.removeEventListener('surroundx-webview-download', onWebViewDownload);
+  }, [conversionResult, runReliableDownload]);
 
   const isConverting =
     phase === 'loading-engine' ||
@@ -554,14 +691,14 @@ export function ConverterStudio({
 
               {alertToast.kind === 'completed' && conversionResult && (
                 <div className="mt-2.5 flex items-center gap-2">
-                  <a
-                    href={conversionResult.url}
-                    download={conversionResult.outputFilename}
-                    className="hardware-cta-primary inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold"
+                  <button
+                    type="button"
+                    onClick={handleManualDownload}
+                    className="hardware-cta-primary inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>Save Output</span>
-                  </a>
+                    <span>Download File</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -1206,18 +1343,108 @@ export function ConverterStudio({
                     </div>
                   )}
 
-                  <a
-                    href={conversionResult.url}
-                    download={conversionResult.outputFilename}
-                    className="hardware-cta-primary w-full py-2.5 px-4 rounded-lg font-semibold text-xs flex items-center justify-center gap-2 focus-visible:outline-2 focus-visible:outline-cyan-300"
-                  >
-                    <Download className="w-4 h-4" aria-hidden="true" />
-                    <span>
-                      {conversionResult.format === '8d-spatial'
-                        ? 'Download 8D Spatial Audio'
-                        : `Download 5.1 ${conversionResult.format.toUpperCase()} File`}
-                    </span>
-                  </a>
+                  {downloadStatus && (
+                    <div
+                      role={
+                        downloadStatus.state === 'error' || downloadStatus.state === 'blocked'
+                          ? 'alert'
+                          : 'status'
+                      }
+                      aria-live="polite"
+                      data-testid="download-status-banner"
+                      className={`rounded-lg px-3 py-2 text-[11px] leading-relaxed border flex items-start gap-2 ${
+                        downloadStatus.state === 'error'
+                          ? 'bg-rose-950/60 border-rose-400/50 text-rose-100'
+                          : downloadStatus.state === 'blocked'
+                            ? 'bg-amber-950/55 border-amber-400/50 text-amber-100'
+                            : downloadStatus.state === 'saving'
+                              ? 'bg-cyan-950/50 border-cyan-400/40 text-cyan-100'
+                              : 'bg-emerald-950/45 border-emerald-400/40 text-emerald-100'
+                      }`}
+                    >
+                      {downloadStatus.state === 'saving' ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0 mt-0.5 text-cyan-300" aria-hidden="true" />
+                      ) : downloadStatus.state === 'error' || downloadStatus.state === 'blocked' ? (
+                        <AlertCircle
+                          className={`w-3.5 h-3.5 shrink-0 mt-0.5 ${
+                            downloadStatus.state === 'error' ? 'text-rose-300' : 'text-amber-300'
+                          }`}
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-300" aria-hidden="true" />
+                      )}
+                      <span className="min-w-0 flex-1 break-words">{downloadStatus.message}</span>
+                    </div>
+                  )}
+
+                  <div className="flex flex-col gap-2">
+                    <button
+                      type="button"
+                      onClick={handleManualDownload}
+                      disabled={downloadStatus?.state === 'saving'}
+                      data-testid="download-file-btn"
+                      className="hardware-cta-primary w-full py-2.5 px-4 rounded-lg font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-cyan-300"
+                    >
+                      <Download className="w-4 h-4 shrink-0" aria-hidden="true" />
+                      <span>Download File</span>
+                      <span className="font-mono text-[10px] opacity-85">
+                        ({conversionResult.format === '8d-spatial' ? '8D' : `5.1 ${conversionResult.format.toUpperCase()}`})
+                      </span>
+                    </button>
+
+                    {(() => {
+                      const caps = detectDownloadCapabilities();
+                      const showFallbacks =
+                        caps.isAndroidNative ||
+                        caps.isMobileBrowser ||
+                        caps.isWebView ||
+                        caps.hasSaveFilePicker ||
+                        downloadStatus?.canShare ||
+                        downloadStatus?.state === 'blocked' ||
+                        downloadStatus?.state === 'error';
+                      if (!showFallbacks) return null;
+                      return (
+                        <div
+                          className="grid grid-cols-2 gap-2"
+                          data-testid="download-fallback-actions"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => void handleShareFallback()}
+                            data-testid="share-file-btn"
+                            className="hardware-btn py-2 px-3 rounded-lg text-[11px] font-medium text-cyan-100 hover:text-white flex items-center justify-center gap-1.5 cursor-pointer focus-visible:outline-2 focus-visible:outline-cyan-300"
+                          >
+                            <Share2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                            <span>Share / Save</span>
+                          </button>
+
+                          {caps.isAndroidNative ? (
+                            <button
+                              type="button"
+                              onClick={() => void handleOpenNativeFallback()}
+                              data-testid="open-file-btn"
+                              className="hardware-btn py-2 px-3 rounded-lg text-[11px] font-medium text-cyan-100 hover:text-white flex items-center justify-center gap-1.5 cursor-pointer focus-visible:outline-2 focus-visible:outline-cyan-300"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                              <span>Open File</span>
+                            </button>
+                          ) : (
+                            <a
+                              href={conversionResult.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              data-testid="open-file-link"
+                              className="hardware-btn py-2 px-3 rounded-lg text-[11px] font-medium text-cyan-100 hover:text-white flex items-center justify-center gap-1.5 focus-visible:outline-2 focus-visible:outline-cyan-300"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                              <span>Open File</span>
+                            </a>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </div>
                 </div>
               )}
             </section>

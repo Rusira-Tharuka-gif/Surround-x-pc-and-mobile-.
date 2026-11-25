@@ -17,7 +17,7 @@ export interface SurroundDesktopBridge {
   showWindow?: () => Promise<void>;
 }
 
-interface BackgroundConversionNativePlugin {
+export interface BackgroundConversionNativePlugin {
   ensureNotificationPermission(): Promise<{ granted: boolean }>;
   startConversion(options: {
     jobId: string;
@@ -42,9 +42,40 @@ interface BackgroundConversionNativePlugin {
     body: string;
     cancelled: boolean;
   }): Promise<void>;
+  beginSaveOutput(options: {
+    filename: string;
+    mimeType: string;
+    totalBytes: number;
+  }): Promise<{ transferId: string }>;
+  appendSaveChunk(options: {
+    transferId: string;
+    base64Chunk: string;
+  }): Promise<{ bytesWritten: number }>;
+  finishSaveOutput(options: {
+    transferId: string;
+    filename: string;
+    mimeType: string;
+  }): Promise<{
+    savedPath: string;
+    contentUri: string;
+    shareUri?: string;
+    locationLabel: string;
+    sizeBytes: number;
+  }>;
+  abortSaveOutput(options: { transferId: string }): Promise<void>;
+  shareOutputFile(options: {
+    contentUri: string;
+    filename: string;
+    mimeType: string;
+  }): Promise<void>;
+  openOutputFile(options: {
+    contentUri: string;
+    filename: string;
+    mimeType: string;
+  }): Promise<void>;
 }
 
-const BackgroundConversionPlugin = registerPlugin<BackgroundConversionNativePlugin>(
+export const BackgroundConversionPlugin = registerPlugin<BackgroundConversionNativePlugin>(
   'BackgroundConversion',
 );
 
