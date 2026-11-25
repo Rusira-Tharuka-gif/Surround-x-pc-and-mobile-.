@@ -15,6 +15,25 @@ export function dbToLinear(db: number): number {
 export const MIN_GAIN_DB = -18;
 export const MAX_GAIN_DB = 6;
 
+/**
+ * Canonical 5.1 surround channel order matching WAVEFORMATEXTENSIBLE (dwChannelMask 0x003F),
+ * Web Audio ChannelMergerNode(6), and FFmpeg 5.1 layout (FL, FR, C, LFE, SL, SR).
+ */
+export const DISCRETE_51_CHANNEL_ORDER: readonly ChannelId[] = ['FL', 'FR', 'C', 'LFE', 'SL', 'SR'];
+
+export const DISCRETE_51_CHANNEL_INDEX: Record<ChannelId, number> = {
+  FL: 0,
+  FR: 1,
+  C: 2,
+  LFE: 3,
+  SL: 4,
+  SR: 5,
+};
+
+export function getDiscrete51ChannelIndex(channelId: ChannelId): number {
+  return DISCRETE_51_CHANNEL_INDEX[channelId];
+}
+
 export function clampGainDb(db: number): number {
   return Math.max(MIN_GAIN_DB, Math.min(MAX_GAIN_DB, Math.round(db * 10) / 10));
 }
@@ -1148,9 +1167,11 @@ export class StreamingMatrixUpmix51 {
     applyEndFade: boolean,
   ): void {
     const bLLow = this.bufLLow;
+    const bLAbove = this.bufLAbove;
     const bLVoc = this.bufLVocal;
     const bLAir = this.bufLAir;
     const bRLow = this.bufRLow;
+    const bRAbove = this.bufRAbove;
     const bRVoc = this.bufRVocal;
     const bRAir = this.bufRAir;
     const bLfe = this.bufLfe;
@@ -1219,7 +1240,8 @@ export class StreamingMatrixUpmix51 {
     for (let k = 0; k < count; k++) {
       const l = leftIn[sOff + k];
       const r = rightIn[sOff + k];
-      const side = (l - r) * 0.5;
+      // Extract surround side ambience from >150 Hz LR4-filtered front signals so sub-bass stays isolated in LFE
+      const side = (bLAbove[k] - bRAbove[k]) * 0.5;
 
       const lLow = bLLow[k];
       const lVocal = bLVoc[k];
@@ -1441,9 +1463,11 @@ export class StreamingMatrixUpmix51 {
     srOut: Float32Array,
   ): void {
     const bLLow = this.bufLLow;
+    const bLAbove = this.bufLAbove;
     const bLVoc = this.bufLVocal;
     const bLAir = this.bufLAir;
     const bRLow = this.bufRLow;
+    const bRAbove = this.bufRAbove;
     const bRVoc = this.bufRVocal;
     const bRAir = this.bufRAir;
     const bLfe = this.bufLfe;
@@ -1509,7 +1533,8 @@ export class StreamingMatrixUpmix51 {
     for (let k = 0; k < count; k++) {
       const l = leftIn[sOff + k];
       const r = rightIn[sOff + k];
-      const side = (l - r) * 0.5;
+      // Extract surround side ambience from >150 Hz LR4-filtered front signals so sub-bass stays isolated in LFE
+      const side = (bLAbove[k] - bRAbove[k]) * 0.5;
 
       const lLow = bLLow[k];
       const lVocal = bLVoc[k];
@@ -1653,12 +1678,12 @@ export class StreamingMatrixUpmix51 {
       const o5 = surroundOutSR * gSR;
 
       const outIdx = sOff + k;
-      flOut[outIdx] = o0 > -0.9 && o0 < 0.9 ? o0 : Math.tanh(o0);
-      frOut[outIdx] = o1 > -0.9 && o1 < 0.9 ? o1 : Math.tanh(o1);
-      cOut[outIdx] = o2 > -0.9 && o2 < 0.9 ? o2 : Math.tanh(o2);
-      lfeOut[outIdx] = o3 > -0.9 && o3 < 0.9 ? o3 : Math.tanh(o3);
-      slOut[outIdx] = o4 > -0.9 && o4 < 0.9 ? o4 : Math.tanh(o4);
-      srOut[outIdx] = o5 > -0.9 && o5 < 0.9 ? o5 : Math.tanh(o5);
+      flOut[outIdx] = o0 > -0.88 && o0 < 0.88 ? o0 : Math.tanh(o0 / 0.95) * 0.95;
+      frOut[outIdx] = o1 > -0.88 && o1 < 0.88 ? o1 : Math.tanh(o1 / 0.95) * 0.95;
+      cOut[outIdx] = o2 > -0.88 && o2 < 0.88 ? o2 : Math.tanh(o2 / 0.95) * 0.95;
+      lfeOut[outIdx] = o3 > -0.88 && o3 < 0.88 ? o3 : Math.tanh(o3 / 0.95) * 0.95;
+      slOut[outIdx] = o4 > -0.88 && o4 < 0.88 ? o4 : Math.tanh(o4 / 0.95) * 0.95;
+      srOut[outIdx] = o5 > -0.88 && o5 < 0.88 ? o5 : Math.tanh(o5 / 0.95) * 0.95;
     }
 
     this.pwrL = pwrL;

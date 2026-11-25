@@ -3,6 +3,7 @@ import { parseAudioHeaderBytes } from './audioHeader';
 import {
   computeBassBeatIntensity,
   computeEffectiveChannelGains,
+  DISCRETE_51_CHANNEL_INDEX,
   get8dAzimuthDegrees,
   wrapAzimuth180,
   wrapAzimuth360,
@@ -416,6 +417,13 @@ export class StageAudioPlayer {
     const sourceNode = this.ensureMediaSource(ctx);
     const chCount = Math.max(2, this.trackChannels);
     const splitter = ctx.createChannelSplitter(chCount);
+    try {
+      splitter.channelCount = chCount;
+      splitter.channelCountMode = 'explicit';
+      splitter.channelInterpretation = 'discrete';
+    } catch {
+      // Safe fallback on mobile browsers
+    }
 
     // Inline per-channel AnalyserNodes wired directly in the live stream path
     const leftAnalyser = ctx.createAnalyser();
@@ -525,7 +533,40 @@ export class StageAudioPlayer {
     const nowStart = ctx.currentTime;
     masterSum.gain.setValueAtTime(0.0001, nowStart);
     masterSum.gain.linearRampToValueAtTime(0.85, nowStart + 0.02);
-    masterSum.connect(ctx.destination);
+
+    let outputLimiter: AudioNode;
+    if (useDiscreteSixOut) {
+      // Per-channel soft peak limiter preserving discrete 6-channel topology (DynamicsCompressorNode clamps to 2ch)
+      const curveLen = 1025;
+      const limiterCurve = new Float32Array(curveLen);
+      for (let i = 0; i < curveLen; i++) {
+        const x = (i / (curveLen - 1)) * 2 - 1;
+        limiterCurve[i] = Math.abs(x) <= 0.88 ? x : Math.tanh(x / 0.95) * 0.95;
+      }
+      const shaper = ctx.createWaveShaper();
+      shaper.curve = limiterCurve;
+      shaper.oversample = 'none';
+      try {
+        shaper.channelCount = 6;
+        shaper.channelCountMode = 'explicit';
+        shaper.channelInterpretation = 'discrete';
+      } catch {
+        // Safe fallback
+      }
+      masterSum.connect(shaper);
+      shaper.connect(ctx.destination);
+      outputLimiter = shaper;
+    } else {
+      const safetyLimiter = ctx.createDynamicsCompressor();
+      safetyLimiter.threshold.setValueAtTime(-1.5, nowStart);
+      safetyLimiter.knee.setValueAtTime(6, nowStart);
+      safetyLimiter.ratio.setValueAtTime(12, nowStart);
+      safetyLimiter.attack.setValueAtTime(0.002, nowStart);
+      safetyLimiter.release.setValueAtTime(0.08, nowStart);
+      masterSum.connect(safetyLimiter);
+      safetyLimiter.connect(ctx.destination);
+      outputLimiter = safetyLimiter;
+    }
 
     // Full-band logarithmic visualizer tap connected directly to live media stream
     const spectrumAnalyser = ctx.createAnalyser();
@@ -543,6 +584,7 @@ export class StageAudioPlayer {
       splitter,
       spectrumAnalyser,
       masterSum,
+      outputLimiter,
       monoSum,
       lfeFilter1,
       lfeFilter2,
@@ -805,13 +847,14 @@ export class StageAudioPlayer {
       lfeFilter2.connect(lowAnalyser);
       lowAnalyser.connect(busGains.LFE);
 
+      // Extract surround side difference from >150 Hz LR4-filtered L/R so <150 Hz bass stays isolated in LFE
       const rightInverter = ctx.createGain();
       rightInverter.gain.value = -1.0;
-      splitter.connect(rightInverter, rightIdx);
+      rAbove.output.connect(rightInverter);
 
       const sideDiffSum = ctx.createGain();
       sideDiffSum.gain.value = 0.92;
-      splitter.connect(sideDiffSum, leftIdx);
+      lAbove.output.connect(sideDiffSum);
       rightInverter.connect(sideDiffSum);
 
       const srInverter = ctx.createGain();
@@ -1202,7 +1245,6 @@ export class StageAudioPlayer {
     const now = ctx.currentTime;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    const panner = ctx.createStereoPanner();
 
     const freqMap: Record<ChannelId, number> = {
       FL: 440,
@@ -1224,7 +1266,6 @@ export class StageAudioPlayer {
 
     osc.type = channelId === 'LFE' ? 'sine' : 'triangle';
     osc.frequency.setValueAtTime(freqMap[channelId], now);
-    panner.pan.setValueAtTime(panMap[channelId], now);
 
     const chGains = computeEffectiveChannelGains(this.channels);
     const targetGain = Math.min(0.32, 0.16 * chGains[channelId]);
@@ -1234,8 +1275,45 @@ export class StageAudioPlayer {
     gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.36);
 
     osc.connect(gain);
-    gain.connect(panner);
-    panner.connect(ctx.destination);
+
+    const maxDestCh = ctx.destination.maxChannelCount || 2;
+    let routeNode: AudioNode;
+    if (maxDestCh >= 6) {
+      try {
+        ctx.destination.channelCount = 6;
+        ctx.destination.channelCountMode = 'explicit';
+        ctx.destination.channelInterpretation = 'discrete';
+      } catch {
+        // Safe fallback on mobile browsers
+      }
+      const merger = ctx.createChannelMerger(6);
+      try {
+        merger.channelCount = 6;
+        merger.channelCountMode = 'explicit';
+        merger.channelInterpretation = 'discrete';
+      } catch {
+        // Safe fallback
+      }
+      gain.connect(merger, 0, DISCRETE_51_CHANNEL_INDEX[channelId]);
+      merger.connect(ctx.destination);
+      routeNode = merger;
+    } else {
+      const panner = ctx.createStereoPanner();
+      panner.pan.setValueAtTime(panMap[channelId], now);
+      gain.connect(panner);
+      panner.connect(ctx.destination);
+      routeNode = panner;
+    }
+
+    osc.onended = () => {
+      try {
+        osc.disconnect();
+        gain.disconnect();
+        routeNode.disconnect();
+      } catch {
+        // Ignore cleanup errors
+      }
+    };
 
     osc.start(now);
     osc.stop(now + 0.38);

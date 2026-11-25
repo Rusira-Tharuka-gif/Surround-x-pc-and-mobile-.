@@ -13,6 +13,8 @@ import {
   createDemoStereoWavBuffer,
   dbToLinear,
   decodePcmWavToChannels,
+  DISCRETE_51_CHANNEL_INDEX,
+  DISCRETE_51_CHANNEL_ORDER,
   encodeMatrixUpmixStereoToSixChannelWav,
   encodeSixChannelPcmWav,
   encodeStereo8dBinauralWavChunks,
@@ -21,6 +23,7 @@ import {
   formatDuration,
   formatFileSize,
   get8dAzimuthDegrees,
+  getDiscrete51ChannelIndex,
   hasCustomChannelEdits,
   isSupportedAudioFile,
   isValidAc3Bitstream,
@@ -604,6 +607,74 @@ test('processInterleavedInt16StereoToWavBytes and 8D Int16 streaming match decod
     assert.equal(fast8dWav[i], ref8dWav[i], `8D byte mismatch at ${i}`);
   }
 });
+
+test('widened 55 Hz + 80 Hz sub-bass stays isolated in LFE without muddying SL/SR surrounds and keeps peaks bounded <= 0.96', () => {
+  const sr = 48000;
+  const n = sr; // 1.0s
+  const left = new Float32Array(n);
+  const right = new Float32Array(n);
+
+  // Widened stereo sub-bass (opposite phase/skewed 55 Hz + 80 Hz) that previously leaked into SL/SR side extraction
+  for (let i = 0; i < n; i++) {
+    const sub55 = Math.sin((2 * Math.PI * 55 * i) / sr) * 0.65;
+    const kick80 = Math.sin((2 * Math.PI * 80 * i) / sr) * 0.45;
+    left[i] = sub55 + kick80 * 0.8;
+    right[i] = sub55 * 0.5 - kick80 * 0.7;
+  }
+
+  const defaultGains = computeEffectiveChannelGains(INITIAL_CHANNELS);
+  const upmixed = matrixUpmixStereoToSixChannels(left, right, defaultGains, 'cinema-pro', sr);
+  const rms = computeSixChannelRmsSummary(upmixed);
+
+  assert.ok(rms.LFE > 0.25, `Expected strong LFE sub-bass output (> 0.25, got ${rms.LFE})`);
+  assert.ok(rms.SL < 0.02, `Expected < 150 Hz widened sub-bass isolated out of SL (< 0.02, got ${rms.SL})`);
+  assert.ok(rms.SR < 0.02, `Expected < 150 Hz widened sub-bass isolated out of SR (< 0.02, got ${rms.SR})`);
+
+  // Verify peak limiting stays strictly bounded <= 0.96 even with +6 dB boost across all 6 channels
+  const hotGains = { FL: 2.0, FR: 2.0, C: 2.0, LFE: 2.0, SL: 2.0, SR: 2.0 };
+  const hotMix = matrixUpmixStereoToSixChannels(
+    left.map((v) => v * 1.1),
+    right.map((v) => v * 1.1),
+    hotGains,
+    'ambient-hall',
+    sr,
+  );
+  for (let ch = 0; ch < 6; ch++) {
+    let chPeak = 0;
+    for (let i = 0; i < hotMix[ch].length; i++) {
+      const a = Math.abs(hotMix[ch][i]);
+      if (a > chPeak) chPeak = a;
+    }
+    assert.ok(chPeak <= 0.96, `Expected channel ${ch} peak <= 0.96, got ${chPeak}`);
+  }
+});
+
+test('DISCRETE_51_CHANNEL_INDEX matches canonical 5.1 slot mapping in encodeSixChannelPcmWav and WAVEFORMATEXTENSIBLE 0x003F', () => {
+  assert.deepEqual(DISCRETE_51_CHANNEL_ORDER, ['FL', 'FR', 'C', 'LFE', 'SL', 'SR']);
+  assert.equal(getDiscrete51ChannelIndex('FL'), 0);
+  assert.equal(getDiscrete51ChannelIndex('FR'), 1);
+  assert.equal(getDiscrete51ChannelIndex('C'), 2);
+  assert.equal(getDiscrete51ChannelIndex('LFE'), 3);
+  assert.equal(getDiscrete51ChannelIndex('SL'), 4);
+  assert.equal(getDiscrete51ChannelIndex('SR'), 5);
+
+  const n = 512;
+  const distinctAmps = [0.11, 0.22, 0.33, 0.44, 0.55, 0.66];
+  const channels = distinctAmps.map((a) => new Float32Array(n).fill(a));
+  const wav = encodeSixChannelPcmWav(channels, 48000);
+  const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+  assert.equal(view.getUint32(40, true), 0x003f);
+
+  const decoded = decodePcmWavToChannels(wav);
+  for (const chId of DISCRETE_51_CHANNEL_ORDER) {
+    const slot = DISCRETE_51_CHANNEL_INDEX[chId];
+    assert.ok(
+      Math.abs(decoded.channels[slot][10] - distinctAmps[slot]) < 1e-3,
+      `Expected slot ${slot} (${chId}) to hold ${distinctAmps[slot]}, got ${decoded.channels[slot][10]}`,
+    );
+  }
+});
+
 
 
 
